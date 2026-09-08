@@ -159,8 +159,16 @@ CLI muzete spoustet pres wrapper `./mk_manager` nebo primo `./main.py`:
 
 ### Automaticky kompletni pruchod (Scan -> Topology -> Update)
 ```bash
+./mk_manager run-all --dry-run
 ./mk_manager run-all
 ```
+
+> [!WARNING]
+> **Doporuceni pro produkcni provoz:** Prikaz `run-all` zatim nebyl plne otestovan v ostre produkci. V realnych ISP sitich se z bezpecnostnich duvodu dorazne doporucuje spoustet jednotlive faze postupne oddelene:
+> 1. `./mk_manager scan` (nacteni a audit zarizeni)
+> 2. `./mk_manager topology` (sber sousedu a vypocet vln)
+> 3. `./mk_manager status` (kontrola dat a kompromitovanych routeru)
+> 4. `./mk_manager update` (spusteni samotneho updatu)
 
 ### Aktualizace nastroje z GitHubu
 Nastroj obsahuje vestaveny prikaz pro aktualizaci zdrojoveho kodu:
