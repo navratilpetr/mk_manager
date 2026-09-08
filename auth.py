@@ -197,6 +197,9 @@ def create_ssh_connection_detail(
                     auth_timeout=timeout,
                     disabled_algorithms=dis_alg
                 )
+                trans = client.get_transport()
+                if trans is not None:
+                    trans.set_keepalive(5)
                 return client, ""
             except TypeError:
                 # Starsie verze paramiko bez parametru disabled_algorithms
@@ -212,6 +215,9 @@ def create_ssh_connection_detail(
                         banner_timeout=timeout,
                         auth_timeout=timeout
                     )
+                    trans = client.get_transport()
+                    if trans is not None:
+                        trans.set_keepalive(5)
                     return client, ""
                 except Exception as te:
                     last_err = str(te)

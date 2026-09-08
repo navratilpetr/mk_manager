@@ -23,7 +23,8 @@ def ping_host(ip: str, timeout: float = 1.0) -> bool:
         res = subprocess.run(
             ["ping", "-c", "1", "-W", str(timeout_int), ip],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
+            timeout=float(timeout_int + 2)
         )
         return res.returncode == 0
     except Exception:

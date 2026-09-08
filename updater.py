@@ -311,7 +311,7 @@ class Updater:
                     continue
 
                 try:
-                    res_raw = execute_ssh_command(client_chk, "/system resource print")
+                    res_raw = execute_ssh_command(client_chk, "/system resource print", timeout=5.0)
                     res_data = parse_key_value_output(res_raw)
                     curr_check_ver = res_data.get("version", "").split()[0]
                     curr_uptime_sec = parse_mikrotik_uptime(res_data.get("uptime", ""))
