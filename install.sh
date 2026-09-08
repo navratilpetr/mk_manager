@@ -10,20 +10,47 @@ echo "================================================================="
 echo "    Instalace MikroTik ISP Manager (mk_manager)"
 echo "================================================================="
 
-# 1. Kontrola Pythonu
+# Pomocne urceni prav (root vs sudo)
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO=""
+elif command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+else
+    SUDO=""
+fi
+
+# 1. Kontrola a instalace Pythonu 3
 if ! command -v python3 >/dev/null 2>&1; then
-    echo "[!] CHYBA: python3 neni nainstalovan."
-    echo "    Na Debianu/Ubuntu: apt update && apt install -y python3 python3-venv"
-    echo "    Na Arch Linuxu:   pacman -S python"
+    echo "[!] python3 nenalezen, pokousim se nainstalovat..."
+    if command -v apt-get >/dev/null 2>&1; then
+        $SUDO apt-get update -y && $SUDO apt-get install -y python3 python3-venv
+    elif command -v pacman >/dev/null 2>&1; then
+        $SUDO pacman -Sy --noconfirm python
+    elif command -v dnf >/dev/null 2>&1; then
+        $SUDO dnf install -y python3
+    fi
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "[!] CHYBA: python3 neni nainstalovan a nepodarilo se jej nainstalovat."
     exit 1
 fi
 
-# 2. Kontrola python3-venv / ensurepip
+# 2. Kontrola a instalace python3-venv / ensurepip
+if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
+    echo "[!] Chybi modul venv / ensurepip, pokousim se doinstalovat..."
+    PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "")
+    if command -v apt-get >/dev/null 2>&1; then
+        $SUDO apt-get update -y
+        $SUDO apt-get install -y python3-venv 2>/dev/null || $SUDO apt-get install -y "python${PY_VER}-venv" 2>/dev/null || true
+    elif command -v pacman >/dev/null 2>&1; then
+        $SUDO pacman -Sy --noconfirm python
+    fi
+fi
+
 if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
     echo "[!] CHYBA: Chybi modul python3-venv / ensurepip."
-    echo "    Na Debianu/Ubuntu spustte:"
-    echo "    apt update && apt install -y python3-venv"
-    echo "    (nebo napr.: apt install -y python3-$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')-venv)"
+    echo "    Na Debianu/Ubuntu spustte rucne: apt update && apt install -y python3-venv"
     exit 1
 fi
 
