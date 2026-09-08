@@ -1,0 +1,69 @@
+# Vzorova konfigurace pro MikroTik ISP Manager (mk_manager)
+# Zkopirujte do config.yaml a upravte podle vasi site:
+# cp config.example.yaml config.yaml
+
+# Sitove rozsahy pro skenovani (CIDR format)
+# UPOZORNENI: Zadejte konkretni management segmenty site (/16 az /30).
+# Nikdy nezadavejte cele /8 (10.0.0.0/8 = 16.7 milionu IP) ani /12.
+networks:
+  - "192.168.88.0/24"
+  - "10.10.10.0/24"
+
+# Pristupove udaje - zkousena jmena a hesla (zkousi se postupne v kombinacich)
+credentials:
+  users:
+    - "admin"
+    - "ispadmin"
+  passwords:
+    - "VaseSilneHeslo1"
+    - "VaseSilneHeslo2"
+
+# Porty sluzeb na routerech (podporuje jedno cislo i seznam portu)
+ports:
+  ssh: 22
+  winbox:
+    - 8291
+  api: 8728
+  api_ssl: 8729
+
+# Parametry skeneru a paralelizace
+scanner:
+  ping_threads: 100            # Pocet vlaken pro ICMP ping sweep
+  ping_timeout: 1.0            # Timeout pingu v sekundach
+  port_threads: 50             # Pocet vlaken pro test portu
+  port_timeout: 1.5            # Timeout TCP spojeni na port
+  auth_threads: 20             # Pocet soubeznych SSH prihlaseni
+  ssh_timeout: 8.0             # Timeout SSH pripojeni
+
+# Timeouty pro proces aktualizace a obnovu (v sekundach)
+timeouts:
+  initial_boot_delay: 60       # Vyckani pred prvnim testem dostupnosti po rebootu
+  ping_retry_interval: 10      # Interval mezi pokusy o ping
+  max_recovery_timeout: 600    # Maximalni doba cekani na nabehnuti routeru po rebootu
+
+# DNS servery pro aktualizace (pokud router nema nastaveny zadny DNS server)
+dns:
+  servers:
+    - "1.1.1.1"
+    - "8.8.8.8"
+
+# Pravidla pro aktualizace
+updater:
+  workers: 10                  # Maximalni pocet soubeznych aktualizaci v ramci jedne vlny
+  max_attempts: 3              # Maximalni pocet pokusu / mezikroku pri upgradu
+  min_disk_free_mb: 0.8        # Minimalni volne misto na disku pred zahajenim updatu (0.8 MB pro 16MB flash)
+  allow_major_upgrade: false   # Prechod z ROS v6 na v7 je prisne zakazan
+  channels:
+    v6: "https://upgrade.mikrotik.com/routeros/NEWEST6.stable"
+    v7: "https://upgrade.mikrotik.com/routeros/NEWESTa7.stable"
+
+# Nastaveni logovani
+logging:
+  level: "INFO"                # DEBUG, INFO, WARNING, ERROR
+  file: "data/mk_manager.log"
+  max_bytes: 10485760          # 10 MB
+  backup_count: 5
+
+# Databaze
+database:
+  path: "data/network.db"

@@ -1,0 +1,27 @@
+# Konfigurace s privatnimi IP a hesly
+config.yaml
+
+# Databaze, vystupni reporty a logy
+data/
+*.db
+*.csv
+*.log
+
+# Virtualni prostredi Pythonu
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Editor swap soubory (vim, vscode, jetbrains)
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+.DS_Store
