@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![RouterOS](https://img.shields.io/badge/RouterOS-v5%20%7C%20v6%20%7C%20v7-green.svg)](https://mikrotik.com)
 
-**MikroTik ISP Manager** je nastroj navrzeny pro spravce siti a poskytovatele internetu (ISP). Umoznuje hromadny audit, automatickou detekci sitove topologie a bezpecny fazovany update RouterOS napric rozsahlymi sitemi (stovky az tisice zarizeni) bez rizika odriznuti vzdalenych lokalit.
+**MikroTik ISP Manager** je nastroj navrzeny pro spravce siti a poskytovatele internetu (ISP). Umoznuje hromadny audit, automatickou detekci sitove topologie a bezpecny fazovany update RouterOS napric rozsahlymi sitemi (stovky az tisice zarizeni) s maximalni minimalizaci rizika odriznuti vzdalenych lokalit.
 
 ---
 
