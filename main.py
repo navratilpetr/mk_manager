@@ -188,7 +188,9 @@ def cmd_update(config: Config, db: Database, args: argparse.Namespace) -> None:
         if len(devs_to_update) == 1:
             dev = devs_to_update[0]
             res = updater.upgrade_single_device(dev, dry_run=args.dry_run)
-            console.print(f"Vysledek aktualizace pro {dev['ip']}: [bold]{res}[/bold]")
+            status, detail = res if isinstance(res, tuple) else (str(res), "")
+            color = "green" if status in ("UPDATED", "DRY_RUN_OK") else ("yellow" if status == "SKIPPED" else "red")
+            console.print(f"Vysledek aktualizace pro {dev['ip']}: [{color}]{status}[/{color}] - {detail}")
         else:
             max_workers = args.workers if args.workers is not None else config.updater_workers
             effective_workers = min(max_workers, len(devs_to_update))
@@ -199,14 +201,19 @@ def cmd_update(config: Config, db: Database, args: argparse.Namespace) -> None:
                     executor.submit(updater.upgrade_single_device, dev, args.dry_run): dev
                     for dev in devs_to_update
                 }
+                completed_count = 0
                 for fut in as_completed(futures):
                     dev = futures[fut]
+                    completed_count += 1
                     try:
                         res = fut.result()
                     except Exception as e:
-                        res = f"EXCEPTION: {e}"
-                    color = "green" if res in ("UPDATED", "DRY_RUN_OK") else ("yellow" if res == "SKIPPED" else "red")
-                    console.print(f"  [{color}]* {dev['ip']} ({dev.get('identity')}): {res}[/{color}]")
+                        res = ("FAILED_UPGRADE", f"EXCEPTION: {e}")
+                    status, detail = res if isinstance(res, tuple) else (str(res), "")
+                    color = "green" if status in ("UPDATED", "DRY_RUN_OK") else ("yellow" if status == "SKIPPED" else "red")
+                    tag = "  OK  " if status in ("UPDATED", "DRY_RUN_OK") else (" SKIP " if status == "SKIPPED" else "CHYBA ")
+                    ident = (dev.get("identity") or dev.get("model") or "MikroTik")[:25]
+                    console.print(f"  [{completed_count}/{len(devs_to_update)}] [{color}][{tag}][/{color}] {dev['ip']} ({ident}): {detail or status}")
     else:
         # Fazovany update podle vln
         updater.run_update_waves(target_wave=args.wave, dry_run=args.dry_run, workers=args.workers)

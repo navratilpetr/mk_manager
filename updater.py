@@ -6,6 +6,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Optional, Tuple
 from rich.console import Console
+from rich.logging import RichHandler
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
 
 from config import Config
@@ -135,7 +136,7 @@ class Updater:
         except Exception as e:
             logger.warning(f"{ip}: Nepodarilo se overit/nastavit DNS: {e}")
 
-    def upgrade_single_device(self, device: Dict[str, Any], dry_run: bool = False) -> str:
+    def upgrade_single_device(self, device: Dict[str, Any], dry_run: bool = False) -> Tuple[str, str]:
         # Bezpecna aktualizace jednoho zarizeni s kontrolami a recovery
         ip = device["ip"]
         dev_id = device["id"]
@@ -153,7 +154,7 @@ class Updater:
             logger.warning(f"{ip}: {msg} - preskakovani")
             if not dry_run:
                 self.db.update_device_status(dev_id, status="SKIPPED", error=msg)
-            return "SKIPPED"
+            return "SKIPPED", msg
 
         # 2. Kontrola volneho mista na disku
         free_bytes = device.get("free_hdd_bytes", 0)
@@ -164,12 +165,12 @@ class Updater:
             logger.error(f"{ip}: {msg} - preskakovani")
             if not dry_run:
                 self.db.update_device_status(dev_id, status="SKIPPED", error=msg)
-            return "SKIPPED"
+            return "SKIPPED", msg
 
         # V rezimu dry-run simulujeme uspesny test bez odeslani prikazu
         if dry_run:
             logger.info(f"[DRY-RUN] {ip}: Simulace overeni a pripravenosti na upgrade probehla v poradku")
-            return "DRY_RUN_OK"
+            return "DRY_RUN_OK", "Simulace overeni v poradku"
 
         # 3. Predbezna kontrola verze pred zahajenim updatu
         if device.get("status") not in ("IN_PROGRESS", "UPDATING"):
@@ -201,7 +202,7 @@ class Updater:
                             is_flagged=is_flag,
                             flagged_reason=flag_reason
                         )
-                        return "UPDATED"
+                        return "UPDATED", f"Jiz bezi na cilove verzi {live_ver}"
                 except Exception as e:
                     logger.debug(f"{ip}: Nelze overit vychozi verzi: {e}")
                 finally:
@@ -220,7 +221,7 @@ class Updater:
                 msg = "Nelze navazat SSH spojeni pred zahajenim updatu"
                 logger.error(f"{ip}: {msg}")
                 self.db.update_device_status(dev_id, status="FAILED_UPGRADE", attempts=attempts, error=msg)
-                return "FAILED_UPGRADE"
+                return "FAILED_UPGRADE", msg
 
             try:
                 # A) Kontrola a automaticke nastaveni DNS pokud na routeru chybi
@@ -240,7 +241,7 @@ class Updater:
                     err_msg = upd_status or chk_raw.strip()
                     logger.error(f"{ip}: Chyba pri kontrole aktualizaci na MikroTik serveru: {err_msg}")
                     self.db.update_device_status(dev_id, status="FAILED_UPGRADE", attempts=attempts, error=f"Chyba update: {err_msg}")
-                    return "FAILED_UPGRADE"
+                    return "FAILED_UPGRADE", f"Chyba update serveru: {err_msg}"
 
                 # C) Spusteni instalace (zahaji stahovani balicku a nasledny reboot)
                 try:
@@ -277,7 +278,7 @@ class Updater:
                             msg = f"Nepodarilo se stahnout balicek {pkg_name}"
                             logger.error(f"{ip}: {msg}")
                             self.db.update_device_status(dev_id, status="FAILED_UPGRADE", attempts=attempts, error=msg)
-                            return "FAILED_UPGRADE"
+                            return "FAILED_UPGRADE", msg
                 except Exception as e:
                     logger.warning(f"{ip}: Chyba pri odesilani update prikazu: {e}")
             finally:
@@ -330,7 +331,7 @@ class Updater:
                         if "ERROR" in pkg_status.upper():
                             logger.error(f"{ip}: Stahovani balicku selhalo: {pkg_status}")
                             self.db.update_device_status(dev_id, status="FAILED_UPGRADE", attempts=attempts, error=f"Chyba stahovani: {pkg_status}")
-                            return "FAILED_UPGRADE"
+                            return "FAILED_UPGRADE", f"Chyba stahovani: {pkg_status}"
 
                         status_info = f", stav: {pkg_status}" if pkg_status else ""
                         logger.info(f"{ip}: Router stahuje balicky a ceka na reboot (uptime: {res_data.get('uptime')}, ubehlo {elapsed}s{status_info})...")
@@ -352,7 +353,7 @@ class Updater:
                 msg = f"Router nedokoncil update/reboot do {self.config.max_recovery_timeout}s"
                 logger.critical(f"{ip}: {msg}!")
                 self.db.update_device_status(dev_id, status="FAILED_UPGRADE", attempts=attempts, error=msg)
-                return "FAILED_UPGRADE"
+                return "FAILED_UPGRADE", msg
 
             # 6. Kontrola stavu, firmwaru a finalizace po rebootu
             time.sleep(3)
@@ -361,7 +362,7 @@ class Updater:
                 msg = "Zarizeni odpovida na ping, ale SSH neodpovida"
                 logger.error(f"{ip}: {msg}")
                 self.db.update_device_status(dev_id, status="FAILED_UPGRADE", attempts=attempts, error=msg)
-                return "FAILED_UPGRADE"
+                return "FAILED_UPGRADE", msg
 
             try:
                 # Vycteni nove verze
@@ -402,7 +403,7 @@ class Updater:
                         is_flagged=is_flag,
                         flagged_reason=flag_reason
                     )
-                    return "UPDATED"
+                    return "UPDATED", f"Aktualizovano na {new_ver}"
                 else:
                     logger.warning(f"{ip}: Dosazena meziverze {new_ver} (cil: {target_ver})")
                     self.db.update_device_status(
@@ -425,7 +426,7 @@ class Updater:
         fail_msg = f"Prekrocen maximalni pocet pokusu ({self.config.max_attempts}) bez dosazeni cilove verze"
         logger.error(f"{ip}: {fail_msg}")
         self.db.update_device_status(dev_id, status="FAILED_UPGRADE", attempts=attempts, error=fail_msg)
-        return "FAILED_UPGRADE"
+        return "FAILED_UPGRADE", fail_msg
 
     def run_update_waves(
         self,
@@ -451,38 +452,115 @@ class Updater:
         if max_workers < 1:
             max_workers = 1
 
-        console.print(f"[bold cyan]Spusteni fazovaneho updatu (celkem vln: {len(sorted_waves)}, soubeznych pracovniku: {max_workers})[/bold cyan]")
-
+        # Spocitani zarizeni k aktualizaci napric vlnami
+        all_to_update: Dict[int, List[Dict[str, Any]]] = {}
+        total_to_update = 0
         for wave in sorted_waves:
-            devices = self.db.get_all_devices(wave=wave)
-            # Filtrovat pouze zarizeni vyzadujici update a seradit numericky podle IP
-            to_update = [d for d in devices if d.get("needs_update")]
-            to_update.sort(key=lambda d: [int(p) for p in d["ip"].split(".") if p.isdigit()] or [0])
+            devs = self.db.get_all_devices(wave=wave)
+            w_upd = [d for d in devs if d.get("needs_update")]
+            w_upd.sort(key=lambda d: [int(p) for p in d["ip"].split(".") if p.isdigit()] or [0])
+            all_to_update[wave] = w_upd
+            total_to_update += len(w_upd)
 
-            effective_workers = min(max_workers, len(to_update)) if to_update else 1
-            console.print(f"\n[bold yellow]=== Zahajeni Vlny {wave} ({len(to_update)} zarizeni k aktualizaci z {len(devices)}, soubezne: {effective_workers}) ===[/bold yellow]")
-            if not to_update:
-                console.print(f"[green]Ve vlne {wave} jiz vsechna zarizeni odpovidaji cilove verzi.[/green]")
-                continue
+        console.print(f"[bold cyan]Spusteni fazovaneho updatu (celkem vln: {len(sorted_waves)}, k aktualizaci: {total_to_update}, soubeznych pracovniku: {max_workers})[/bold cyan]")
 
-            if effective_workers > 1:
-                with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-                    futures = {
-                        executor.submit(self.upgrade_single_device, dev, dry_run): dev
-                        for dev in to_update
-                    }
-                    for fut in as_completed(futures):
-                        dev = futures[fut]
-                        try:
-                            res = fut.result()
-                        except Exception as e:
-                            res = f"EXCEPTION: {e}"
-                        color = "green" if res in ("UPDATED", "DRY_RUN_OK") else ("yellow" if res == "SKIPPED" else "red")
-                        console.print(f"  [{color}]* {dev['ip']} ({dev.get('identity')}): {res}[/{color}]")
+        if total_to_update == 0:
+            console.print("[bold green]Vsechna zarizeni v siti jiz odpovidaji cilove verzi, zadna aktualizace neni nutna.[/bold green]")
+            return
+
+        # Odhad casu dokonceni pouze pri vetsim poctu zarizeni (50+)
+        if total_to_update >= 50:
+            total_est_seconds = 0
+            for wave in sorted_waves:
+                w_count = len(all_to_update[wave])
+                if w_count > 0:
+                    eff = min(max_workers, w_count)
+                    batches = (w_count + eff - 1) // eff
+                    total_est_seconds += batches * 150
+
+            est_minutes = max(1, round(total_est_seconds / 60))
+            if est_minutes >= 60:
+                h = est_minutes // 60
+                m = est_minutes % 60
+                est_str = f"{h} h {m} min"
             else:
-                for dev in to_update:
-                    res = self.upgrade_single_device(dev, dry_run=dry_run)
-                    color = "green" if res in ("UPDATED", "DRY_RUN_OK") else ("yellow" if res == "SKIPPED" else "red")
-                    console.print(f"  [{color}]* {dev['ip']} ({dev.get('identity')}): {res}[/{color}]")
+                est_str = f"cca {est_minutes} min"
 
-            console.print(f"[bold green]=== Vlna {wave} dokoncena ===[/bold green]")
+            console.print(f"[bold yellow]Odhadovany cas dokonceni cele site: {est_str} (pocitano pro {total_to_update} zarizeni pri prumeru 2.5 min/zarizeni)[/bold yellow]")
+
+        # Potlaceni verbose logu z konzole behem updatu (vsechny detaily zustavaji v souboru mk_manager.log)
+        root_logger = logging.getLogger("mk_manager")
+        rich_handlers = [h for h in root_logger.handlers if isinstance(h, RichHandler)]
+        orig_levels = {h: h.level for h in rich_handlers}
+        for h in rich_handlers:
+            h.setLevel(logging.CRITICAL)
+
+        total_ok = 0
+        total_skipped = 0
+        total_failed = 0
+
+        try:
+            for wave in sorted_waves:
+                devices = self.db.get_all_devices(wave=wave)
+                to_update = all_to_update.get(wave, [])
+                total_wave = len(to_update)
+
+                if not to_update:
+                    continue
+
+                effective_workers = min(max_workers, total_wave)
+                console.print(f"\n[bold yellow]=== Zahajeni Vlny {wave} ({total_wave} zarizeni k aktualizaci z {len(devices)}, soubezne: {effective_workers}) ===[/bold yellow]")
+
+                completed_count = 0
+                wave_ok = 0
+                wave_skipped = 0
+                wave_failed = 0
+
+                def process_result(dev: Dict[str, Any], res: Any):
+                    nonlocal completed_count, wave_ok, wave_skipped, wave_failed
+                    completed_count += 1
+                    status, detail = res if isinstance(res, tuple) else (str(res), "")
+                    ip = dev["ip"]
+                    ident = (dev.get("identity") or dev.get("model") or "MikroTik")[:25]
+                    prefix = f"  [{completed_count}/{total_wave}]"
+
+                    if status in ("UPDATED", "DRY_RUN_OK"):
+                        wave_ok += 1
+                        console.print(f"{prefix} [bold green][  OK  ][/bold green] {ip} ({ident}): {detail or status}")
+                    elif status == "SKIPPED":
+                        wave_skipped += 1
+                        console.print(f"{prefix} [bold yellow][ SKIP ][/bold yellow] {ip} ({ident}): {detail or status}")
+                    else:
+                        wave_failed += 1
+                        console.print(f"{prefix} [bold red][CHYBA ][/bold red] {ip} ({ident}): {detail or status}")
+
+                if effective_workers > 1:
+                    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                        futures = {
+                            executor.submit(self.upgrade_single_device, dev, dry_run): dev
+                            for dev in to_update
+                        }
+                        for fut in as_completed(futures):
+                            dev = futures[fut]
+                            try:
+                                res = fut.result()
+                            except Exception as e:
+                                res = ("FAILED_UPGRADE", f"Vyjinka: {e}")
+                            process_result(dev, res)
+                else:
+                    for dev in to_update:
+                        try:
+                            res = self.upgrade_single_device(dev, dry_run=dry_run)
+                        except Exception as e:
+                            res = ("FAILED_UPGRADE", f"Vyjinka: {e}")
+                        process_result(dev, res)
+
+                total_ok += wave_ok
+                total_skipped += wave_skipped
+                total_failed += wave_failed
+                console.print(f"[bold green]=== Vlna {wave} dokoncena ({wave_ok} aktualizovano, {wave_skipped} preskoceno, {wave_failed} chyb) ===[/bold green]")
+
+            console.print(f"\n[bold cyan]=== Fazovany update dokoncen (celkem: {total_ok} aktualizovano, {total_skipped} preskoceno, {total_failed} chyb) ===[/bold cyan]")
+        finally:
+            for h, lvl in orig_levels.items():
+                h.setLevel(lvl)
