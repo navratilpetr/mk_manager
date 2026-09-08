@@ -134,21 +134,6 @@ class TopologyManager:
                             "source": "GATEWAY_MAC"
                         })
 
-                # 6. Vycteni L3 cesty pres traceroute 1.1.1.1
-                tr_raw = execute_ssh_command(client, "/tool traceroute address=1.1.1.1 count=1 use-dns=no", timeout=8.0)
-                if tr_raw:
-                    for line in tr_raw.splitlines():
-                        m_tr = re.search(r"^\s*(\d+)\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", line)
-                        if m_tr:
-                            hop_num = int(m_tr.group(1))
-                            hop_ip = m_tr.group(2)
-                            if hop_ip not in ("1.1.1.1", "0.0.0.0", ip):
-                                all_detected_neighbors.append({
-                                    "ip": hop_ip,
-                                    "interface": str(hop_num),
-                                    "source": "TRACEROUTE"
-                                })
-
                 self.db.save_neighbors(dev_id, all_detected_neighbors)
                 logger.debug(f"Zarizeni {ip} ({dev.get('identity')}): nalezeno {len(all_detected_neighbors)} vazeb")
             except Exception as e:

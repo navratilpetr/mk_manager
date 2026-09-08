@@ -139,10 +139,15 @@ def parse_key_value_output(output: str) -> Dict[str, str]:
 
 
 def execute_ssh_command(client: paramiko.SSHClient, command: str, timeout: float = 10.0) -> str:
-    # Spusteni prikazu na MikroTiku bez strankovani
-    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-    raw = stdout.read().decode("utf-8", errors="ignore")
-    return strip_ansi(raw)
+    # Spusteni prikazu na MikroTiku bez strankovani s bezpecnym timeoutem
+    try:
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        stdout.channel.settimeout(timeout)
+        raw = stdout.read().decode("utf-8", errors="ignore")
+        return strip_ansi(raw)
+    except Exception as e:
+        logger.debug(f"Prikaz '{command[:40]}' vyprsel nebo selhal: {e}")
+        return ""
 
 
 def _close_client(client: paramiko.SSHClient) -> None:
