@@ -18,15 +18,18 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-# 2. Kontrola python3-venv
-if ! python3 -m venv --help >/dev/null 2>&1; then
-    echo "[!] CHYBA: Chybi modul python3-venv."
-    echo "    Na Debianu/Ubuntu spustte: apt update && apt install -y python3-venv"
+# 2. Kontrola python3-venv / ensurepip
+if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
+    echo "[!] CHYBA: Chybi modul python3-venv / ensurepip."
+    echo "    Na Debianu/Ubuntu spustte:"
+    echo "    apt update && apt install -y python3-venv"
+    echo "    (nebo napr.: apt install -y python3-$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')-venv)"
     exit 1
 fi
 
 # 3. Vytvoreni virtualniho prostredi
-if [ ! -d "venv" ]; then
+if [ ! -f "venv/bin/pip" ]; then
+    rm -rf venv
     echo "[+] Vytvarim virtualni prostredi Python (venv)..."
     python3 -m venv venv
 else
