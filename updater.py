@@ -73,10 +73,12 @@ def fetch_latest_channel_version(url: str, fallback: str) -> str:
     return fallback
 
 
-def check_device_security(client: Any) -> Tuple[bool, Optional[str]]:
-    # Kontrola bezpecnosti a kompromitace po upgradu (flagged: yes, ucet ops, exploit v logu)
+def check_device_security(client: Any) -> Tuple[bool, Optional[str], Optional[str]]:
+    # Kontrola bezpecnosti a kompromitace po upgradu
+    # Vraci: (is_flagged, flagged_reason, security_notice)
     is_flagged = False
     reasons = []
+    notice = None
     try:
         dm_raw = execute_ssh_command(client, "/system device-mode print", timeout=4.0)
         if dm_raw and re.search(r"flagged:\s*yes", dm_raw, re.IGNORECASE):
@@ -95,13 +97,16 @@ def check_device_security(client: Any) -> Tuple[bool, Optional[str]]:
 
     try:
         log_raw = execute_ssh_command(client, '/log print without-paging where message~"-2"', timeout=4.0)
-        if log_raw and ("user -2" in log_raw or "ssh:-2@" in log_raw):
-            is_flagged = True
-            reasons.append("detekovan exploit v logu (user -2)")
+        if log_raw:
+            if "added by ssh:-2" in log_raw or re.search(r"logged in.*(-2|ssh:-2)", log_raw, re.IGNORECASE):
+                is_flagged = True
+                reasons.append("potvrzeny prunik v logu: ucet/pristup pres ssh:-2")
+            elif "user -2" in log_raw or "ssh:-2@" in log_raw:
+                notice = "neuspesny pokus o exploit v logu (login failure user -2 - odrazeno)"
     except Exception:
         pass
 
-    return is_flagged, (", ".join(reasons) if reasons else None)
+    return is_flagged, (", ".join(reasons) if reasons else None), notice
 
 
 class Updater:
@@ -148,15 +153,7 @@ class Updater:
 
         logger.info(f"Zpracovani updatu pro {ip} (aktualni: {device.get('current_version')}, cil: {target_ver})")
 
-        # 1. Kontrola internetoveho pripojeni
-        if not device.get("has_internet"):
-            msg = "Zarizeni nema pristup k internetu pro stazeni balicku"
-            logger.warning(f"{ip}: {msg} - preskakovani")
-            if not dry_run:
-                self.db.update_device_status(dev_id, status="SKIPPED", error=msg)
-            return "SKIPPED", msg
-
-        # 2. Kontrola volneho mista na disku
+        # 1. Kontrola volneho mista na disku
         free_bytes = device.get("free_hdd_bytes", 0)
         min_bytes = int(self.config.min_disk_free_mb * 1024 * 1024)
         if free_bytes > 0 and free_bytes < min_bytes:
@@ -193,14 +190,15 @@ class Updater:
                         except Exception:
                             pass
 
-                        is_flag, flag_reason = check_device_security(client_init)
+                        is_flag, flag_reason, sec_notice = check_device_security(client_init)
                         self.db.update_device_status(
                             dev_id,
                             status="UPDATED",
                             current_version=live_ver,
                             needs_update=False,
                             is_flagged=is_flag,
-                            flagged_reason=flag_reason
+                            flagged_reason=flag_reason,
+                            security_notice=sec_notice
                         )
                         return "UPDATED", f"Jiz bezi na cilove verzi {live_ver}"
                 except Exception as e:
@@ -239,9 +237,12 @@ class Updater:
                 upd_status = upd_pr.get("status", "")
                 if "ERROR" in upd_status.upper() or "ERROR" in chk_raw.upper():
                     err_msg = upd_status or chk_raw.strip()
-                    logger.error(f"{ip}: Chyba pri kontrole aktualizaci na MikroTik serveru: {err_msg}")
-                    self.db.update_device_status(dev_id, status="FAILED_UPGRADE", attempts=attempts, error=f"Chyba update: {err_msg}")
-                    return "FAILED_UPGRADE", f"Chyba update serveru: {err_msg}"
+                    logger.warning(f"{ip}: Router se nemuze spojit s MikroTik update serverem: {err_msg}")
+                    self.db.update_device_status(dev_id, status="SKIPPED", attempts=attempts, error=f"Nelze spojit s update serverem: {err_msg}", has_internet=False)
+                    return "SKIPPED", f"Nelze spojit s update serverem ({err_msg})"
+
+                # Router uspesne navazal spojeni se serverem - internet je funkcni
+                self.db.update_device_status(dev_id, has_internet=True)
 
                 # C) Spusteni instalace (zahaji stahovani balicku a nasledny reboot)
                 try:
@@ -387,7 +388,7 @@ class Updater:
                 if is_target or not needs_more:
                     logger.info(f"{ip}: Uspesne aktualizovan na cilovou verzi {new_ver}")
                     # Bezpecnostni test po dokonceni aktualizace (flagged: yes, ops)
-                    is_flag, flag_reason = check_device_security(client_after)
+                    is_flag, flag_reason, sec_notice = check_device_security(client_after)
                     if is_flag:
                         logger.critical(f"{ip}: POZOR! Zarizeni je po aktualizaci kompromitovano: {flag_reason}")
                         console.print(f"[bold white on red]KRITICKE VAROVANI: {ip} byl po aktualizaci detekovan jako KOMPROMITOVANY ({flag_reason})![/bold white on red]")
@@ -401,7 +402,8 @@ class Updater:
                         needs_update=False,
                         attempts=attempts,
                         is_flagged=is_flag,
-                        flagged_reason=flag_reason
+                        flagged_reason=flag_reason,
+                        security_notice=sec_notice
                     )
                     return "UPDATED", f"Aktualizovano na {new_ver}"
                 else:
@@ -502,7 +504,31 @@ class Updater:
         try:
             for wave in sorted_waves:
                 devices = self.db.get_all_devices(wave=wave)
-                to_update = all_to_update.get(wave, [])
+                raw_to_update = all_to_update.get(wave, [])
+
+                # Deduplikace zarizeni v ramci vlny (ochrana proti dvojitemu updatu tehoz routeru s vice IP)
+                seen_sns = set()
+                seen_macs = set()
+                seen_ips = set()
+                to_update = []
+                for d in raw_to_update:
+                    sn = d.get("serial_number")
+                    mac = d.get("mac")
+                    ip = d.get("ip")
+                    if sn and sn.strip() and sn.strip().lower() not in ("none", "null", "unknown", "") and sn in seen_sns:
+                        continue
+                    if mac and mac.strip() and mac.strip().upper() not in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF", "") and mac in seen_macs:
+                        continue
+                    if ip and ip in seen_ips:
+                        continue
+                    if sn and sn.strip() and sn.strip().lower() not in ("none", "null", "unknown", ""):
+                        seen_sns.add(sn)
+                    if mac and mac.strip() and mac.strip().upper() not in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF", ""):
+                        seen_macs.add(mac)
+                    if ip:
+                        seen_ips.add(ip)
+                    to_update.append(d)
+
                 total_wave = len(to_update)
 
                 if not to_update:
@@ -510,6 +536,11 @@ class Updater:
 
                 effective_workers = min(max_workers, total_wave)
                 console.print(f"\n[bold yellow]=== Zahajeni Vlny {wave} ({total_wave} zarizeni k aktualizaci z {len(devices)}, soubezne: {effective_workers}) ===[/bold yellow]")
+
+                initial_batch = [f"{d['ip']} ({(d.get('identity') or d.get('model') or 'MikroTik')[:25]})" for d in to_update[:effective_workers]]
+                console.print(f"  [cyan]-> Zahajeno zpracovani prvnich {len(initial_batch)} zarizeni (stahovani a restart routeru, cca 1.5 - 3 min):[/cyan]")
+                for dev_str in initial_batch:
+                    console.print(f"     [dim]• {dev_str}[/dim]")
 
                 completed_count = 0
                 wave_ok = 0
@@ -534,26 +565,29 @@ class Updater:
                         wave_failed += 1
                         console.print(f"{prefix} [bold red][CHYBA ][/bold red] {ip} ({ident}): {detail or status}")
 
-                if effective_workers > 1:
-                    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-                        futures = {
-                            executor.submit(self.upgrade_single_device, dev, dry_run): dev
-                            for dev in to_update
-                        }
-                        for fut in as_completed(futures):
-                            dev = futures[fut]
+                with console.status(f"[bold cyan]Vlna {wave}: Probiha stahovani a reboot routeru (zpracovano 0/{total_wave}, bezi {effective_workers} vlaken)...[/bold cyan]") as status_bar:
+                    if effective_workers > 1:
+                        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                            futures = {
+                                executor.submit(self.upgrade_single_device, dev, dry_run): dev
+                                for dev in to_update
+                            }
+                            for fut in as_completed(futures):
+                                dev = futures[fut]
+                                try:
+                                    res = fut.result()
+                                except Exception as e:
+                                    res = ("FAILED_UPGRADE", f"Vyjinka: {e}")
+                                process_result(dev, res)
+                                status_bar.update(f"[bold cyan]Vlna {wave}: Probiha aktualizace (hotovo {completed_count}/{total_wave} | {wave_ok} OK, {wave_failed} chyb)...[/bold cyan]")
+                    else:
+                        for dev in to_update:
                             try:
-                                res = fut.result()
+                                res = self.upgrade_single_device(dev, dry_run=dry_run)
                             except Exception as e:
                                 res = ("FAILED_UPGRADE", f"Vyjinka: {e}")
                             process_result(dev, res)
-                else:
-                    for dev in to_update:
-                        try:
-                            res = self.upgrade_single_device(dev, dry_run=dry_run)
-                        except Exception as e:
-                            res = ("FAILED_UPGRADE", f"Vyjinka: {e}")
-                        process_result(dev, res)
+                            status_bar.update(f"[bold cyan]Vlna {wave}: Probiha aktualizace (hotovo {completed_count}/{total_wave} | {wave_ok} OK, {wave_failed} chyb)...[/bold cyan]")
 
                 total_ok += wave_ok
                 total_skipped += wave_skipped

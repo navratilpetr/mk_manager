@@ -24,6 +24,7 @@ except ImportError:
 import argparse
 
 from config import Config, setup_logger, APP_VERSION
+from version import get_latest_github_version, is_newer_version
 from database import Database
 from scanner import Scanner
 from topology import TopologyManager
@@ -187,7 +188,10 @@ def cmd_update(config: Config, db: Database, args: argparse.Namespace) -> None:
 
         if len(devs_to_update) == 1:
             dev = devs_to_update[0]
-            res = updater.upgrade_single_device(dev, dry_run=args.dry_run)
+            ident = (dev.get("identity") or dev.get("model") or "MikroTik")[:25]
+            console.print(f"  [cyan]-> Zahajena aktualizace pro {dev['ip']} ({ident})... Probiha stahovani a reboot (cca 1.5 - 3 min).[/cyan]")
+            with console.status(f"[bold cyan]Aktualizace {dev['ip']} probiha (stahovani balicku a reboot)...[/bold cyan]"):
+                res = updater.upgrade_single_device(dev, dry_run=args.dry_run)
             status, detail = res if isinstance(res, tuple) else (str(res), "")
             color = "green" if status in ("UPDATED", "DRY_RUN_OK") else ("yellow" if status == "SKIPPED" else "red")
             console.print(f"Vysledek aktualizace pro {dev['ip']}: [{color}]{status}[/{color}] - {detail}")
@@ -195,25 +199,38 @@ def cmd_update(config: Config, db: Database, args: argparse.Namespace) -> None:
             max_workers = args.workers if args.workers is not None else config.updater_workers
             effective_workers = min(max_workers, len(devs_to_update))
             console.print(f"[bold cyan]Spusteni aktualizace pro {len(devs_to_update)} vybranych zarizeni (soubezne: {effective_workers}):[/bold cyan]")
+            initial_batch = [f"{d['ip']} ({(d.get('identity') or d.get('model') or 'MikroTik')[:25]})" for d in devs_to_update[:effective_workers]]
+            console.print(f"  [cyan]-> Zahajeno zpracovani prvnich {len(initial_batch)} zarizeni (stahovani a restart routeru, cca 1.5 - 3 min):[/cyan]")
+            for dev_str in initial_batch:
+                console.print(f"     [dim]• {dev_str}[/dim]")
+
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-                futures = {
-                    executor.submit(updater.upgrade_single_device, dev, args.dry_run): dev
-                    for dev in devs_to_update
-                }
-                completed_count = 0
-                for fut in as_completed(futures):
-                    dev = futures[fut]
-                    completed_count += 1
-                    try:
-                        res = fut.result()
-                    except Exception as e:
-                        res = ("FAILED_UPGRADE", f"EXCEPTION: {e}")
-                    status, detail = res if isinstance(res, tuple) else (str(res), "")
-                    color = "green" if status in ("UPDATED", "DRY_RUN_OK") else ("yellow" if status == "SKIPPED" else "red")
-                    tag = "  OK  " if status in ("UPDATED", "DRY_RUN_OK") else (" SKIP " if status == "SKIPPED" else "CHYBA ")
-                    ident = (dev.get("identity") or dev.get("model") or "MikroTik")[:25]
-                    console.print(f"  [{completed_count}/{len(devs_to_update)}] [{color}][{tag}][/{color}] {dev['ip']} ({ident}): {detail or status}")
+            with console.status(f"[bold cyan]Probiha aktualizace {len(devs_to_update)} zarizeni (0/{len(devs_to_update)} hotovo, bezi {effective_workers} vlaken)...[/bold cyan]") as status_bar:
+                with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                    futures = {
+                        executor.submit(updater.upgrade_single_device, dev, args.dry_run): dev
+                        for dev in devs_to_update
+                    }
+                    completed_count = 0
+                    ok_count = 0
+                    fail_count = 0
+                    for fut in as_completed(futures):
+                        dev = futures[fut]
+                        completed_count += 1
+                        try:
+                            res = fut.result()
+                        except Exception as e:
+                            res = ("FAILED_UPGRADE", f"EXCEPTION: {e}")
+                        status, detail = res if isinstance(res, tuple) else (str(res), "")
+                        color = "green" if status in ("UPDATED", "DRY_RUN_OK") else ("yellow" if status == "SKIPPED" else "red")
+                        tag = "  OK  " if status in ("UPDATED", "DRY_RUN_OK") else (" SKIP " if status == "SKIPPED" else "CHYBA ")
+                        if status in ("UPDATED", "DRY_RUN_OK"):
+                            ok_count += 1
+                        elif status != "SKIPPED":
+                            fail_count += 1
+                        ident = (dev.get("identity") or dev.get("model") or "MikroTik")[:25]
+                        console.print(f"  [{completed_count}/{len(devs_to_update)}] [{color}][{tag}][/{color}] {dev['ip']} ({ident}): {detail or status}")
+                        status_bar.update(f"[bold cyan]Probiha aktualizace (hotovo {completed_count}/{len(devs_to_update)} | {ok_count} OK, {fail_count} chyb)...[/bold cyan]")
     else:
         # Fazovany update podle vln
         updater.run_update_waves(target_wave=args.wave, dry_run=args.dry_run, workers=args.workers)
@@ -235,41 +252,7 @@ def cmd_status(config: Config, db: Database, args: argparse.Namespace) -> None:
         console.print("[yellow]V databazi zatim nejsou zadna data. Pouzijte prikaz 'scan'.[/yellow]")
         return
 
-    # 1. Tabulka zarizeni vyzadujicich aktualizaci
-    outdated = [d for d in db.get_all_devices() if d.get("needs_update") and d.get("status") not in ("UPDATED",)]
-    if outdated:
-        out_table = Table(title=f"[bold red]Zarizeni vyzadujici aktualizaci ({len(outdated)})[/bold red]")
-        out_table.add_column("IP", style="cyan", no_wrap=True)
-        out_table.add_column("Identity", style="bold magenta")
-        out_table.add_column("Model", style="blue")
-        out_table.add_column("Verze aktualni", justify="center", style="red")
-        out_table.add_column("Verze cilova", justify="center", style="green")
-        out_table.add_column("Internet", justify="center")
-        out_table.add_column("DNS", justify="center")
-        out_table.add_column("Vlna", justify="center")
-        out_table.add_column("Status", justify="center")
-
-        for d in sorted(outdated, key=ip_sort_key):
-            has_net = d.get("has_internet")
-            net_str = "[green]OK[/green]" if has_net else "[bold red]FAIL[/bold red]"
-            has_dns = d.get("has_dns")
-            dns_str = "[green]OK[/green]" if has_dns or has_dns is None else "[yellow]CHYBI[/yellow]"
-            status = d.get("status", "")
-            s_color = "red" if "FAIL" in status else "yellow"
-            out_table.add_row(
-                d.get("ip", ""),
-                d.get("identity") or "-",
-                d.get("model") or "-",
-                d.get("current_version") or "-",
-                d.get("target_version") or "-",
-                net_str,
-                dns_str,
-                str(d.get("wave", 0)),
-                f"[{s_color}]{status}[/{s_color}]",
-            )
-        console.print(out_table)
-
-    # 2. Tabulka aktualnich zarizeni (v poradku, nevyzaduji update)
+    # 1. Tabulka aktualnich zarizeni (v poradku, nevyzaduji update)
     uptodate = [d for d in db.get_all_devices() if not d.get("needs_update") and d.get("status") in ("AUDITED", "UPDATED")]
     if uptodate:
         up_table = Table(title=f"[bold green]Aktualni zarizeni v poradku ({len(uptodate)})[/bold green]")
@@ -336,6 +319,84 @@ def cmd_status(config: Config, db: Database, args: argparse.Namespace) -> None:
             )
         console.print(fl_table)
 
+    # 5a. Bezpecnostni upozorneni: Zaznamenane pokusy o exploit v logu (odrazeno / login failure)
+    notice_devs = [d for d in db.get_all_devices() if d.get("security_notice") and not d.get("is_flagged")]
+    if notice_devs:
+        not_table = Table(title=f"[bold yellow]Bezpecnostni upozorneni: Zaznamenane pokusy o exploit v logu ({len(notice_devs)})[/bold yellow]")
+        not_table.add_column("IP", style="cyan", no_wrap=True)
+        not_table.add_column("Identity", style="bold magenta")
+        not_table.add_column("Model", style="blue")
+        not_table.add_column("Verze", justify="center")
+        not_table.add_column("Stav zabezpeceni", justify="center")
+        not_table.add_column("Detaily z logu", style="yellow")
+        for d in sorted(notice_devs, key=ip_sort_key):
+            sec_status = "[green]Odrazeno (aktualni verze)[/green]" if not d.get("needs_update") else "[yellow]Doporucen update[/yellow]"
+            not_table.add_row(
+                d.get("ip", ""),
+                d.get("identity") or "-",
+                d.get("model") or "-",
+                d.get("current_version") or "-",
+                sec_status,
+                d.get("security_notice") or "-",
+            )
+        console.print(not_table)
+
+    # 5b. Tabulka zarizeni vyzadujicich manualni pozornost (SKIPPED / FAILED)
+    manual_devs = [
+        d for d in db.get_all_devices()
+        if d.get("status") in ("SKIPPED", "FAILED_UPGRADE") or (d.get("status") and d.get("status").startswith("FAILED"))
+    ]
+    if manual_devs:
+        man_table = Table(title=f"[bold yellow]Zarizeni vyzadujici manualni pozornost ({len(manual_devs)})[/bold yellow]")
+        man_table.add_column("IP", style="cyan", no_wrap=True)
+        man_table.add_column("Identity", style="bold magenta")
+        man_table.add_column("Model", style="blue")
+        man_table.add_column("Verze", justify="center")
+        man_table.add_column("Status", justify="center", style="bold red")
+        man_table.add_column("Duvod / Posledni chyba", style="yellow")
+        for d in sorted(manual_devs, key=ip_sort_key):
+            man_table.add_row(
+                d.get("ip", ""),
+                d.get("identity") or "-",
+                d.get("model") or "-",
+                d.get("current_version") or "-",
+                d.get("status") or "-",
+                d.get("last_error") or "-",
+            )
+    # 5c. Tabulka zarizeni vyzadujicich aktualizaci (presunuto na konec pred souhrn)
+    outdated = [d for d in db.get_all_devices() if d.get("needs_update") and d.get("status") not in ("UPDATED",)]
+    if outdated:
+        out_table = Table(title=f"[bold red]Zarizeni vyzadujici aktualizaci ({len(outdated)})[/bold red]")
+        out_table.add_column("IP", style="cyan", no_wrap=True)
+        out_table.add_column("Identity", style="bold magenta")
+        out_table.add_column("Model", style="blue")
+        out_table.add_column("Verze aktualni", justify="center", style="red")
+        out_table.add_column("Verze cilova", justify="center", style="green")
+        out_table.add_column("Internet", justify="center")
+        out_table.add_column("DNS", justify="center")
+        out_table.add_column("Vlna", justify="center")
+        out_table.add_column("Status", justify="center")
+
+        for d in sorted(outdated, key=ip_sort_key):
+            has_net = d.get("has_internet")
+            net_str = "[green]OK[/green]" if has_net else "[bold red]FAIL[/bold red]"
+            has_dns = d.get("has_dns")
+            dns_str = "[green]OK[/green]" if has_dns or has_dns is None else "[yellow]CHYBI[/yellow]"
+            status = d.get("status", "")
+            s_color = "red" if "FAIL" in status else "yellow"
+            out_table.add_row(
+                d.get("ip", ""),
+                d.get("identity") or "-",
+                d.get("model") or "-",
+                d.get("current_version") or "-",
+                d.get("target_version") or "-",
+                net_str,
+                dns_str,
+                str(d.get("wave", 0)),
+                f"[{s_color}]{status}[/{s_color}]",
+            )
+        console.print(out_table)
+
     # 6. Celkovy souhrnny prehled stavu site (na samotnem konci pro maximalni viditelnost)
     table = Table(title=f"[bold green]Celkovy prehled stavu site ISP (Cil: ROS v6={latest_v6} | ROS v7={latest_v7})[/bold green]")
     table.add_column("Metrika", style="cyan")
@@ -343,8 +404,13 @@ def cmd_status(config: Config, db: Database, args: argparse.Namespace) -> None:
 
     table.add_row("Celkem evidovanych routeru", str(total))
     flagged_cnt = stats.get("flagged", 0)
-    flag_str = f"[bold white on red] {flagged_cnt} (POZOR: MikroTrick/flagged) [/bold white on red]" if flagged_cnt > 0 else "[green]0 (V poradku)[/green]"
-    table.add_row("Podezreni na kompromitaci (flagged/ops)", flag_str)
+    flag_str = f"[bold white on red] {flagged_cnt} (POZOR: ops ucet / device-mode) [/bold white on red]" if flagged_cnt > 0 else "[green]0 (V poradku)[/green]"
+    table.add_row("Potvrzena kompromitace (flagged/ops)", flag_str)
+
+    sec_cnt = stats.get("security_notices", 0)
+    if sec_cnt > 0:
+        table.add_row("Pokusy o exploit v logu (odrazeno)", f"[yellow]{sec_cnt} (pouze neuspesne pokusy v logu)[/yellow]")
+
     table.add_row("Vyzaduje aktualizaci (zranitelne/stare)", f"[bold red]{stats.get('needs_update', 0)}[/bold red]")
     table.add_row("Uspesne aktualizovano (UPDATED)", f"[bold green]{stats.get('updated', 0)}[/bold green]")
     table.add_row("Selhala aktualizace (FAILED_UPGRADE)", f"[red]{stats.get('failed', 0)}[/red]")
@@ -355,6 +421,16 @@ def cmd_status(config: Config, db: Database, args: argparse.Namespace) -> None:
     missing_dns = len([d for d in db.get_all_devices() if d.get("has_dns") is False])
     if missing_dns > 0:
         table.add_row("Chybejici DNS (doplni se pri updatu)", f"[bold yellow]{missing_dns}[/bold yellow]")
+
+    table.add_row("Verze aplikace (mk_manager)", f"[bold cyan]v{APP_VERSION}[/bold cyan]")
+    latest_github = get_latest_github_version()
+    if latest_github:
+        if is_newer_version(latest_github, APP_VERSION):
+            table.add_row("Dostupna nova verze (GitHub)", f"[bold yellow]v{latest_github} (spustte: ./mk_manager self-update)[/bold yellow]")
+        elif latest_github == APP_VERSION:
+            table.add_row("Stav verze mk_manager", "[green]Aktualni verze[/green]")
+        else:
+            table.add_row("Stav verze mk_manager", f"[dim]Vyvojova / mistni verze (GitHub: v{latest_github})[/dim]")
 
     console.print(table)
 
@@ -390,6 +466,23 @@ def cmd_self_update(config: Config, db: Database, args: argparse.Namespace) -> N
         console.print("[bold green]Aktualizace probehla uspesne![/bold green]")
     except Exception as e:
         console.print(f"[bold red]Chyba pri aktualizaci: {e}[/bold red]")
+
+
+def cmd_version(config: Config, db: Database, args: argparse.Namespace) -> None:
+    print_banner()
+    console.print(f"Lokalni verze nastroje: [bold cyan]v{APP_VERSION}[/bold cyan]")
+    console.print("[dim]Overuji nejnovejsi verzi na GitHubu...[/dim]")
+    latest_github = get_latest_github_version()
+    if latest_github:
+        if is_newer_version(latest_github, APP_VERSION):
+            console.print(f"[bold yellow]Dostupna novejsi verze na GitHubu: v{latest_github}[/bold yellow]")
+            console.print("Pro aktualizaci spustte: [cyan]./mk_manager self-update[/cyan]")
+        elif latest_github == APP_VERSION:
+            console.print(f"[bold green]Aplikace je aktualni (GitHub: v{latest_github}).[/bold green]")
+        else:
+            console.print(f"[bold cyan]Pouzivate vyvojovou / predbeznou verzi (GitHub: v{latest_github}).[/bold cyan]")
+    else:
+        console.print("[yellow]Nepodarilo se overit verzi na GitHubu (offline rezim nebo nedostupne API).[/yellow]")
 
 
 def main() -> None:
@@ -433,6 +526,9 @@ def main() -> None:
     # self-update
     subparsers.add_parser("self-update", help="Aktualizace nastroje z GitHub repozitare (git pull + venv pip)")
 
+    # version
+    subparsers.add_parser("version", help="Zobrazeni aktualni verze nastroje a kontrola updatu na GitHubu")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -465,6 +561,7 @@ def main() -> None:
         "status": cmd_status,
         "run-all": cmd_run_all,
         "self-update": cmd_self_update,
+        "version": cmd_version,
     }
 
     cmd_fn = commands.get(args.command)

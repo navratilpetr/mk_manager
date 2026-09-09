@@ -9,7 +9,7 @@ import yaml
 from rich.logging import RichHandler
 
 
-APP_VERSION = "1.0.0"
+from version import __version__ as APP_VERSION
 
 
 class Config:

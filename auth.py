@@ -345,9 +345,8 @@ def audit_device(
         gw_match = re.search(r"gateway=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", route_raw)
         device_data["gateway"] = gw_match.group(1) if gw_match else None
 
-        # 7. Test internetoveho pripojeni
-        ping_raw = execute_ssh_command(client, "/ping 8.8.8.8 count=3", timeout=15.0)
-        # Hledame 'received=X' nebo 'packet-loss=0%'
+        # 7. Test internetoveho pripojeni (ping 8.8.8.8 s fallbackem na MikroTik update server)
+        ping_raw = execute_ssh_command(client, "/ping 8.8.8.8 count=2", timeout=6.0)
         loss_match = re.search(r"packet-loss=([0-9]+)%", ping_raw)
         recv_match = re.search(r"received=([0-9]+)", ping_raw)
 
@@ -356,6 +355,11 @@ def audit_device(
             has_internet = True
         elif recv_match and int(recv_match.group(1)) > 0:
             has_internet = True
+        else:
+            # Fallback pro routery v management siti kde firewall zahazuje odchozi ICMP ping
+            upd_chk = execute_ssh_command(client, "/system package update check-for-updates once", timeout=6.0)
+            if "latest-version" in upd_chk or ("status:" in upd_chk and "ERROR" not in upd_chk.upper()):
+                has_internet = True
         device_data["has_internet"] = has_internet
 
         # 8. Vycteni nastaveni DNS
@@ -370,6 +374,7 @@ def audit_device(
         # 9. Bezpecnostni audit - detekce kompromitace (MikroTrick, CVE-2026-67276, flagged: yes)
         is_flagged = False
         flagged_reasons = []
+        security_notice = None
 
         # A) Kontrola /system device-mode
         try:
@@ -392,14 +397,20 @@ def audit_device(
         # C) Kontrola logu na anomalie 'user -2'
         try:
             log_raw = execute_ssh_command(client, '/log print without-paging where message~"-2"', timeout=4.0)
-            if log_raw and ("user -2" in log_raw or "ssh:-2@" in log_raw):
-                is_flagged = True
-                flagged_reasons.append("detekovan exploit v logu (user -2)")
+            if log_raw:
+                # Rozliseni potvrzeneho pruniku vs neuspesneho pokusu o prihlaseni
+                if "added by ssh:-2" in log_raw or re.search(r"logged in.*(-2|ssh:-2)", log_raw, re.IGNORECASE):
+                    is_flagged = True
+                    flagged_reasons.append("potvrzeny prunik v logu: ucet/pristup pres ssh:-2")
+                elif "user -2" in log_raw or "ssh:-2@" in log_raw:
+                    # Pouze neuspesny pokus o exploit (router pokus odrazil / login failure)
+                    security_notice = "neuspesny pokus o exploit v logu (login failure user -2 - odrazeno)"
         except Exception:
             pass
 
         device_data["is_flagged"] = is_flagged
         device_data["flagged_reason"] = ", ".join(flagged_reasons) if flagged_reasons else None
+        device_data["security_notice"] = security_notice
 
     except Exception as e:
         logger.warning(f"Chyba pri auditu zarizeni {ip}: {e}")

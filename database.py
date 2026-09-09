@@ -4,6 +4,7 @@ import json
 import sqlite3
 import csv
 import logging
+import threading
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -14,6 +15,7 @@ class Database:
     def __init__(self, db_path: str):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
         self.init_db()
 
     def get_connection(self) -> sqlite3.Connection:
@@ -83,6 +85,25 @@ class Database:
                 cursor.execute("ALTER TABLE devices ADD COLUMN dns_servers TEXT")
             except sqlite3.OperationalError:
                 pass
+            try:
+                cursor.execute("ALTER TABLE devices ADD COLUMN security_notice TEXT")
+            except sqlite3.OperationalError:
+                pass
+
+            # Migrace existujicich falesnych flagged zaznamu (pokud slo pouze o user -2 v logu bez ops/flagged)
+            try:
+                cursor.execute("""
+                    UPDATE devices 
+                    SET is_flagged = 0, 
+                        security_notice = flagged_reason, 
+                        flagged_reason = NULL 
+                    WHERE is_flagged = 1 
+                      AND flagged_reason LIKE '%user -2%' 
+                      AND flagged_reason NOT LIKE '%potvrzen%'
+                      AND (flagged_reason NOT LIKE '%ops%' AND flagged_reason NOT LIKE '%device-mode%')
+                """)
+            except Exception:
+                pass
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS neighbors (
@@ -144,6 +165,129 @@ class Database:
             """)
             conn.commit()
 
+        self.cleanup_duplicate_devices()
+
+    def cleanup_duplicate_devices(self) -> int:
+        # Slouceni a odstraneni duplicitnich zaznamu se stejnym seriovym cislem nebo MAC adresou
+        merged_count = 0
+        with self._lock:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+
+                # 1. Deduplikace podle serial_number
+                cursor.execute("""
+                    SELECT serial_number, GROUP_CONCAT(id) as id_str, COUNT(*) as cnt
+                    FROM devices
+                    WHERE serial_number IS NOT NULL 
+                      AND serial_number != '' 
+                      AND LOWER(serial_number) NOT IN ('none', 'null', 'unknown')
+                    GROUP BY serial_number HAVING cnt > 1
+                """)
+                sn_dups = cursor.fetchall()
+                for row in sn_dups:
+                    ids = [int(x) for x in row["id_str"].split(",")]
+                    id_list = ",".join(str(i) for i in ids)
+                    cursor.execute(f"SELECT * FROM devices WHERE id IN ({id_list})")
+                    devices = [dict(r) for r in cursor.fetchall()]
+                    if len(devices) <= 1:
+                        continue
+
+                    # Kanonicky zaznam: UPDATED ma prednost, pak AUDITED, pak nejvyssi id
+                    canonical = max(
+                        devices,
+                        key=lambda d: (
+                            2 if d.get("status") == "UPDATED" else (1 if d.get("status") == "AUDITED" else 0),
+                            1 if d.get("current_version") else 0,
+                            d["id"]
+                        )
+                    )
+                    duplicates = [d for d in devices if d["id"] != canonical["id"]]
+
+                    all_ips = set()
+                    all_macs = set()
+                    for d in devices:
+                        if d.get("ip"):
+                            all_ips.add(d["ip"])
+                        if d.get("all_ips"):
+                            try:
+                                all_ips.update(json.loads(d["all_ips"]))
+                            except Exception:
+                                pass
+                        if d.get("mac"):
+                            all_macs.add(d["mac"].upper())
+                        if d.get("all_macs"):
+                            try:
+                                all_macs.update(m.upper() for m in json.loads(d["all_macs"]))
+                            except Exception:
+                                pass
+
+                    merged_ips_json = json.dumps(sorted(list(all_ips)))
+                    merged_macs_json = json.dumps(sorted(list(all_macs)))
+
+                    cursor.execute("""
+                        UPDATE devices SET
+                            all_ips = ?,
+                            all_macs = ?
+                        WHERE id = ?
+                    """, (merged_ips_json, merged_macs_json, canonical["id"]))
+
+                    for dup in duplicates:
+                        cursor.execute("UPDATE neighbors SET device_id = ? WHERE device_id = ?", (canonical["id"], dup["id"]))
+                        cursor.execute("DELETE FROM devices WHERE id = ?", (dup["id"],))
+                        merged_count += 1
+                        logger.info(f"Sloucen duplicitni router {dup.get('ip')} do {canonical.get('ip')} (SN: {row['serial_number']})")
+
+                # 2. Deduplikace podle MAC adresy (pokud zustaly duplikaty bez SN)
+                cursor.execute("""
+                    SELECT mac, GROUP_CONCAT(id) as id_str, COUNT(*) as cnt
+                    FROM devices
+                    WHERE mac IS NOT NULL 
+                      AND mac != '' 
+                      AND mac NOT IN ('00:00:00:00:00:00', 'FF:FF:FF:FF:FF:FF')
+                    GROUP BY mac HAVING cnt > 1
+                """)
+                mac_dups = cursor.fetchall()
+                for row in mac_dups:
+                    ids = [int(x) for x in row["id_str"].split(",")]
+                    id_list = ",".join(str(i) for i in ids)
+                    cursor.execute(f"SELECT * FROM devices WHERE id IN ({id_list})")
+                    devices = [dict(r) for r in cursor.fetchall()]
+                    if len(devices) <= 1:
+                        continue
+
+                    canonical = max(
+                        devices,
+                        key=lambda d: (
+                            2 if d.get("status") == "UPDATED" else (1 if d.get("status") == "AUDITED" else 0),
+                            1 if d.get("current_version") else 0,
+                            d["id"]
+                        )
+                    )
+                    duplicates = [d for d in devices if d["id"] != canonical["id"]]
+
+                    all_ips = set()
+                    for d in devices:
+                        if d.get("ip"):
+                            all_ips.add(d["ip"])
+                        if d.get("all_ips"):
+                            try:
+                                all_ips.update(json.loads(d["all_ips"]))
+                            except Exception:
+                                pass
+
+                    merged_ips_json = json.dumps(sorted(list(all_ips)))
+                    cursor.execute("UPDATE devices SET all_ips = ? WHERE id = ?", (merged_ips_json, canonical["id"]))
+
+                    for dup in duplicates:
+                        cursor.execute("UPDATE neighbors SET device_id = ? WHERE device_id = ?", (canonical["id"], dup["id"]))
+                        cursor.execute("DELETE FROM devices WHERE id = ?", (dup["id"],))
+                        merged_count += 1
+                        logger.info(f"Sloucen duplicitni router {dup.get('ip')} do {canonical.get('ip')} (MAC: {row['mac']})")
+
+                conn.commit()
+
+        return merged_count
+
     def cleanup_networks(self, allowed_networks: List[str]) -> int:
         # Odstraneni zarizeni z databaze, jejichz rozsah byl odebran z config.yaml
         if not allowed_networks:
@@ -193,157 +337,210 @@ class Database:
         new_ips = set(data.get("all_ips", [ip]))
         new_ips.add(ip)
 
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            existing_row = None
+        with self._lock:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                existing_row = None
 
-            # 1. Hledani podle serial number (deduplikace) - pouze platne SN
-            if sn and sn.strip() and sn.strip().lower() not in ("none", "null", "unknown", ""):
-                cursor.execute("SELECT * FROM devices WHERE serial_number = ? LIMIT 1", (sn.strip(),))
-                existing_row = cursor.fetchone()
+                # 1. Hledani podle serial number (deduplikace) - pouze platne SN
+                if sn and sn.strip() and sn.strip().lower() not in ("none", "null", "unknown", ""):
+                    cursor.execute("SELECT * FROM devices WHERE serial_number = ? LIMIT 1", (sn.strip(),))
+                    existing_row = cursor.fetchone()
 
-            # 2. Hledani podle MAC adresy (pokud neni SN) - NIKDY nededuplikovat podle fiktivni 00:00:00:00:00:00!
-            if not existing_row and mac and mac.strip() and mac.strip().upper() not in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF", ""):
-                cursor.execute("SELECT * FROM devices WHERE mac = ? LIMIT 1", (mac.strip().upper(),))
-                existing_row = cursor.fetchone()
+                # 2. Hledani podle MAC adresy (pokud neni SN) - NIKDY nededuplikovat podle fiktivni 00:00:00:00:00:00!
+                if not existing_row and mac and mac.strip() and mac.strip().upper() not in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF", ""):
+                    cursor.execute("SELECT * FROM devices WHERE mac = ? LIMIT 1", (mac.strip().upper(),))
+                    existing_row = cursor.fetchone()
 
-            # 3. Hledani podle primarni IP
-            if not existing_row:
-                cursor.execute("SELECT * FROM devices WHERE ip = ? LIMIT 1", (ip,))
-                existing_row = cursor.fetchone()
+                # 3. Hledani zda aktualni IP neni v all_ips existujiciho routeru
+                if not existing_row:
+                    cursor.execute("SELECT * FROM devices WHERE all_ips LIKE ? LIMIT 1", (f'%"{ip}"%',))
+                    existing_row = cursor.fetchone()
 
-            if existing_row:
-                dev_id = existing_row["id"]
-                # Slouceni IP adres
-                old_ips_json = existing_row["all_ips"]
-                current_ips = set()
-                if old_ips_json:
-                    try:
-                        current_ips = set(json.loads(old_ips_json))
-                    except Exception:
-                        pass
-                current_ips.update(new_ips)
-                merged_ips_json = json.dumps(sorted(list(current_ips)))
+                # 4. Hledani podle primarni IP
+                if not existing_row:
+                    cursor.execute("SELECT * FROM devices WHERE ip = ? LIMIT 1", (ip,))
+                    existing_row = cursor.fetchone()
 
-                # Slouceni MAC adres
-                new_macs = set(data.get("all_macs", []))
-                if mac:
-                    new_macs.add(mac.upper())
-                old_macs_json = existing_row["all_macs"] if "all_macs" in existing_row.keys() else None
-                current_macs = set()
-                if old_macs_json:
-                    try:
-                        current_macs = set(json.loads(old_macs_json))
-                    except Exception:
-                        pass
-                current_macs.update(new_macs)
-                merged_macs_json = json.dumps(sorted(list(current_macs)))
+                if existing_row:
+                    dev_id = existing_row["id"]
 
-                cursor.execute("""
-                    UPDATE devices SET
-                        all_ips = ?,
-                        all_macs = ?,
-                        gateway = COALESCE(?, gateway),
-                        mac = COALESCE(?, mac),
-                        serial_number = COALESCE(?, serial_number),
-                        identity = COALESCE(?, identity),
-                        model = COALESCE(?, model),
-                        architecture = COALESCE(?, architecture),
-                        current_version = COALESCE(?, current_version),
-                        target_version = COALESCE(?, target_version),
-                        needs_update = COALESCE(?, needs_update),
-                        has_internet = COALESCE(?, has_internet),
-                        has_dns = COALESCE(?, has_dns),
-                        dns_servers = COALESCE(?, dns_servers),
-                        free_hdd_bytes = COALESCE(?, free_hdd_bytes),
-                        total_hdd_bytes = COALESCE(?, total_hdd_bytes),
-                        username = COALESCE(?, username),
-                        password = COALESCE(?, password),
-                        ssh_port = COALESCE(?, ssh_port),
-                        status = COALESCE(?, status),
-                        is_flagged = COALESCE(?, is_flagged),
-                        flagged_reason = COALESCE(?, flagged_reason),
-                        last_seen = CURRENT_TIMESTAMP,
-                        last_error = ?
-                    WHERE id = ?
-                """, (
-                    merged_ips_json,
-                    merged_macs_json,
-                    data.get("gateway"),
-                    mac,
-                    sn,
-                    data.get("identity"),
-                    data.get("model"),
-                    data.get("architecture"),
-                    data.get("current_version"),
-                    data.get("target_version"),
-                    data.get("needs_update"),
-                    data.get("has_internet"),
-                    1 if data.get("has_dns") else 0 if "has_dns" in data else None,
-                    data.get("dns_servers"),
-                    data.get("free_hdd_bytes"),
-                    data.get("total_hdd_bytes"),
-                    data.get("username"),
-                    data.get("password"),
-                    data.get("ssh_port", 22),
-                    data.get("status"),
-                    1 if data.get("is_flagged") else 0 if "is_flagged" in data else None,
-                    data.get("flagged_reason"),
-                    data.get("last_error"),
-                    dev_id,
-                ))
-                conn.commit()
-                return dev_id
-            else:
-                # Novy zaznam
-                ips_json = json.dumps(sorted(list(new_ips)))
-                new_macs = set(data.get("all_macs", []))
-                if mac:
-                    new_macs.add(mac.upper())
-                macs_json = json.dumps(sorted(list(new_macs)))
+                    # Slouceni IP adres
+                    old_ips_json = existing_row["all_ips"]
+                    current_ips = set()
+                    if old_ips_json:
+                        try:
+                            current_ips = set(json.loads(old_ips_json))
+                        except Exception:
+                            pass
+                    current_ips.update(new_ips)
 
-                cursor.execute("""
-                    INSERT INTO devices (
-                        ip, all_ips, all_macs, gateway, mac, serial_number, identity, model, architecture,
-                        current_version, target_version, needs_update, has_internet, has_dns, dns_servers,
-                        free_hdd_bytes, total_hdd_bytes, username, password, ssh_port,
-                        status, wave, attempts, is_flagged, flagged_reason, last_seen, last_error
-                    ) VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?
-                    )
-                """, (
-                    ip,
-                    ips_json,
-                    macs_json,
-                    data.get("gateway"),
-                    mac,
-                    sn,
-                    data.get("identity"),
-                    data.get("model"),
-                    data.get("architecture"),
-                    data.get("current_version"),
-                    data.get("target_version"),
-                    1 if data.get("needs_update") else 0,
-                    1 if data.get("has_internet") else 0,
-                    1 if data.get("has_dns", True) else 0,
-                    data.get("dns_servers", ""),
-                    data.get("free_hdd_bytes", 0),
-                    data.get("total_hdd_bytes", 0),
-                    data.get("username"),
-                    data.get("password"),
-                    data.get("ssh_port", 22),
-                    data.get("status", "DISCOVERED"),
-                    data.get("wave", 0),
-                    data.get("attempts", 0),
-                    1 if data.get("is_flagged") else 0,
-                    data.get("flagged_reason"),
-                    data.get("last_error"),
-                ))
-                conn.commit()
-                return cursor.lastrowid
+                    # Slouceni MAC adres
+                    new_macs = set(data.get("all_macs", []))
+                    if mac:
+                        new_macs.add(mac.upper())
+                    old_macs_json = existing_row["all_macs"] if "all_macs" in existing_row.keys() else None
+                    current_macs = set()
+                    if old_macs_json:
+                        try:
+                            current_macs = set(json.loads(old_macs_json))
+                        except Exception:
+                            pass
+                    current_macs.update(new_macs)
+
+                    # Odstraneni a slouceni pripadneho druheho zaznamu se stejnou IP nebo stejnym SN
+                    cursor.execute("SELECT id, all_ips, all_macs FROM devices WHERE ip = ? AND id != ?", (ip, dev_id))
+                    for other_r in cursor.fetchall():
+                        other_id = other_r["id"]
+                        if other_r["all_ips"]:
+                            try:
+                                current_ips.update(json.loads(other_r["all_ips"]))
+                            except Exception:
+                                pass
+                        if other_r["all_macs"]:
+                            try:
+                                current_macs.update(m.upper() for m in json.loads(other_r["all_macs"]))
+                            except Exception:
+                                pass
+                        cursor.execute("UPDATE neighbors SET device_id = ? WHERE device_id = ?", (dev_id, other_id))
+                        cursor.execute("DELETE FROM devices WHERE id = ?", (other_id,))
+
+                    if sn and sn.strip() and sn.strip().lower() not in ("none", "null", "unknown", ""):
+                        cursor.execute("SELECT id, all_ips, all_macs FROM devices WHERE serial_number = ? AND id != ?", (sn.strip(), dev_id))
+                        for other_r in cursor.fetchall():
+                            other_id = other_r["id"]
+                            if other_r["all_ips"]:
+                                try:
+                                    current_ips.update(json.loads(other_r["all_ips"]))
+                                except Exception:
+                                    pass
+                            if other_r["all_macs"]:
+                                try:
+                                    current_macs.update(m.upper() for m in json.loads(other_r["all_macs"]))
+                                except Exception:
+                                    pass
+                            cursor.execute("UPDATE neighbors SET device_id = ? WHERE device_id = ?", (dev_id, other_id))
+                            cursor.execute("DELETE FROM devices WHERE id = ?", (other_id,))
+
+                    merged_ips_json = json.dumps(sorted(list(current_ips)))
+                    merged_macs_json = json.dumps(sorted(list(current_macs)))
+
+                    # Zachovani statusu UPDATED pokud zarizeni jiz bylo uspesne aktualizovano
+                    new_status = data.get("status")
+                    needs_upd = data.get("needs_update")
+                    if existing_row["status"] == "UPDATED":
+                        if new_status not in ("UPDATED",):
+                            new_status = "UPDATED"
+                        needs_upd = False
+
+                    cursor.execute("""
+                        UPDATE devices SET
+                            all_ips = ?,
+                            all_macs = ?,
+                            gateway = COALESCE(?, gateway),
+                            mac = COALESCE(?, mac),
+                            serial_number = COALESCE(?, serial_number),
+                            identity = COALESCE(?, identity),
+                            model = COALESCE(?, model),
+                            architecture = COALESCE(?, architecture),
+                            current_version = COALESCE(?, current_version),
+                            target_version = COALESCE(?, target_version),
+                            needs_update = COALESCE(?, needs_update),
+                            has_internet = COALESCE(?, has_internet),
+                            has_dns = COALESCE(?, has_dns),
+                            dns_servers = COALESCE(?, dns_servers),
+                            free_hdd_bytes = COALESCE(?, free_hdd_bytes),
+                            total_hdd_bytes = COALESCE(?, total_hdd_bytes),
+                            username = COALESCE(?, username),
+                            password = COALESCE(?, password),
+                            ssh_port = COALESCE(?, ssh_port),
+                            status = COALESCE(?, status),
+                            is_flagged = COALESCE(?, is_flagged),
+                            flagged_reason = COALESCE(?, flagged_reason),
+                            security_notice = COALESCE(?, security_notice),
+                            last_seen = CURRENT_TIMESTAMP,
+                            last_error = ?
+                        WHERE id = ?
+                    """, (
+                        merged_ips_json,
+                        merged_macs_json,
+                        data.get("gateway"),
+                        mac,
+                        sn,
+                        data.get("identity"),
+                        data.get("model"),
+                        data.get("architecture"),
+                        data.get("current_version"),
+                        data.get("target_version"),
+                        needs_upd,
+                        data.get("has_internet"),
+                        1 if data.get("has_dns") else 0 if "has_dns" in data else None,
+                        data.get("dns_servers"),
+                        data.get("free_hdd_bytes"),
+                        data.get("total_hdd_bytes"),
+                        data.get("username"),
+                        data.get("password"),
+                        data.get("ssh_port", 22),
+                        new_status,
+                        1 if data.get("is_flagged") else 0 if "is_flagged" in data else None,
+                        data.get("flagged_reason"),
+                        data.get("security_notice"),
+                        data.get("last_error"),
+                        dev_id,
+                    ))
+                    conn.commit()
+                    return dev_id
+                else:
+                    # Novy zaznam
+                    ips_json = json.dumps(sorted(list(new_ips)))
+                    new_macs = set(data.get("all_macs", []))
+                    if mac:
+                        new_macs.add(mac.upper())
+                    macs_json = json.dumps(sorted(list(new_macs)))
+
+                    cursor.execute("""
+                        INSERT INTO devices (
+                            ip, all_ips, all_macs, gateway, mac, serial_number, identity, model, architecture,
+                            current_version, target_version, needs_update, has_internet, has_dns, dns_servers,
+                            free_hdd_bytes, total_hdd_bytes, username, password, ssh_port,
+                            status, wave, attempts, is_flagged, flagged_reason, security_notice, last_seen, last_error
+                        ) VALUES (
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?
+                        )
+                    """, (
+                        ip,
+                        ips_json,
+                        macs_json,
+                        data.get("gateway"),
+                        mac,
+                        sn,
+                        data.get("identity"),
+                        data.get("model"),
+                        data.get("architecture"),
+                        data.get("current_version"),
+                        data.get("target_version"),
+                        1 if data.get("needs_update") else 0,
+                        1 if data.get("has_internet") else 0,
+                        1 if data.get("has_dns", True) else 0,
+                        data.get("dns_servers", ""),
+                        data.get("free_hdd_bytes", 0),
+                        data.get("total_hdd_bytes", 0),
+                        data.get("username"),
+                        data.get("password"),
+                        data.get("ssh_port", 22),
+                        data.get("status", "DISCOVERED"),
+                        data.get("wave", 0),
+                        data.get("attempts", 0),
+                        1 if data.get("is_flagged") else 0,
+                        data.get("flagged_reason"),
+                        data.get("security_notice"),
+                        data.get("last_error"),
+                    ))
+                    conn.commit()
+                    return cursor.lastrowid
 
     def refresh_target_versions(self, latest_v6: str, latest_v7: str) -> None:
         # Prepocet cilovych verzi a needs_update podle aktualnich verzi z MikroTik serveru
@@ -370,31 +567,38 @@ class Database:
     def update_device_status(
         self,
         device_id: int,
-        status: str,
+        status: Optional[str] = None,
         current_version: Optional[str] = None,
         needs_update: Optional[bool] = None,
         attempts: Optional[int] = None,
         error: Optional[str] = None,
         is_flagged: Optional[bool] = None,
-        flagged_reason: Optional[str] = None
+        flagged_reason: Optional[str] = None,
+        has_internet: Optional[bool] = None,
+        security_notice: Optional[str] = None
     ) -> None:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             flag_val = None
             if is_flagged is not None:
                 flag_val = 1 if is_flagged else 0
+            net_val = None
+            if has_internet is not None:
+                net_val = 1 if has_internet else 0
             cursor.execute("""
                 UPDATE devices SET
-                    status = ?,
+                    status = COALESCE(?, status),
                     current_version = COALESCE(?, current_version),
                     needs_update = COALESCE(?, needs_update),
                     attempts = COALESCE(?, attempts),
                     is_flagged = COALESCE(?, is_flagged),
                     flagged_reason = COALESCE(?, flagged_reason),
+                    has_internet = COALESCE(?, has_internet),
+                    security_notice = COALESCE(?, security_notice),
                     last_error = ?,
                     last_seen = CURRENT_TIMESTAMP
                 WHERE id = ?
-            """, (status, current_version, needs_update, attempts, flag_val, flagged_reason, error, device_id))
+            """, (status, current_version, needs_update, attempts, flag_val, flagged_reason, net_val, security_notice, error, device_id))
             conn.commit()
 
     def update_device_dns(self, device_id: int, has_dns: bool, dns_servers: str) -> None:
@@ -471,7 +675,7 @@ class Database:
             "id", "ip", "all_ips", "serial_number", "mac", "identity",
             "model", "architecture", "current_version", "target_version",
             "needs_update", "has_internet", "free_hdd_mb", "total_hdd_mb",
-            "is_flagged", "flagged_reason",
+            "is_flagged", "flagged_reason", "security_notice",
             "wave", "status", "attempts", "last_seen", "last_error"
         ]
 
@@ -498,6 +702,7 @@ class Database:
                     "total_hdd_mb": total_mb,
                     "is_flagged": bool(d.get("is_flagged")),
                     "flagged_reason": d.get("flagged_reason") or "",
+                    "security_notice": d.get("security_notice") or "",
                     "wave": d.get("wave", 0),
                     "status": d.get("status"),
                     "attempts": d.get("attempts", 0),
@@ -514,6 +719,9 @@ class Database:
 
             cursor.execute("SELECT COUNT(*) FROM devices WHERE is_flagged = 1")
             flagged = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) FROM devices WHERE security_notice IS NOT NULL AND (is_flagged IS NULL OR is_flagged = 0)")
+            sec_notices = cursor.fetchone()[0]
 
             cursor.execute("SELECT COUNT(*) FROM devices WHERE needs_update = 1")
             needs_update = cursor.fetchone()[0]
@@ -552,6 +760,7 @@ class Database:
             return {
                 "total": total,
                 "flagged": flagged,
+                "security_notices": sec_notices,
                 "needs_update": needs_update,
                 "updated": updated,
                 "failed": failed,
