@@ -1,6 +1,7 @@
 # Modul pro overovani credentials a audit zarizeni pres SSH s podporou legacy sifer
 import re
 import socket
+import time
 import logging
 import threading
 from typing import Dict, Any, List, Optional, Tuple
@@ -139,14 +140,31 @@ def parse_key_value_output(output: str) -> Dict[str, str]:
 
 
 def execute_ssh_command(client: paramiko.SSHClient, command: str, timeout: float = 10.0) -> str:
-    # Spusteni prikazu na MikroTiku bez strankovani s bezpecnym timeoutem
+    # Spusteni prikazu na MikroTiku s prisnym hlidanim celkoveho casu (zabranuje zamrznuti spojeni)
     try:
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-        stdout.channel.settimeout(timeout)
-        raw = stdout.read().decode("utf-8", errors="ignore")
+        stdout.channel.settimeout(1.0)
+        start_t = time.time()
+        chunks = []
+        while True:
+            if time.time() - start_t > timeout:
+                logger.debug(f"Prikaz '{command[:40]}' vyprsel po {timeout}s")
+                break
+            try:
+                data = stdout.channel.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+            except socket.timeout:
+                if stdout.channel.exit_status_ready() or stdout.channel.closed:
+                    break
+                continue
+            except Exception:
+                break
+        raw = b"".join(chunks).decode("utf-8", errors="ignore")
         return strip_ansi(raw)
     except Exception as e:
-        logger.debug(f"Prikaz '{command[:40]}' vyprsel nebo selhal: {e}")
+        logger.debug(f"Prikaz '{command[:40]}' selhal: {e}")
         return ""
 
 

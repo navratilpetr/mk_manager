@@ -3,7 +3,7 @@ import urllib.request
 import json
 from typing import Optional
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 
 def get_latest_github_version(repo: str = "navratilpetr/mk_manager", timeout: float = 2.0) -> Optional[str]:

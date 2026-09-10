@@ -204,7 +204,7 @@ def cmd_update(config: Config, db: Database, args: argparse.Namespace) -> None:
             for dev_str in initial_batch:
                 console.print(f"     [dim]• {dev_str}[/dim]")
 
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
             with console.status(f"[bold cyan]Probiha aktualizace {len(devs_to_update)} zarizeni (0/{len(devs_to_update)} hotovo, bezi {effective_workers} vlaken)...[/bold cyan]") as status_bar:
                 with ThreadPoolExecutor(max_workers=effective_workers) as executor:
                     futures = {
@@ -214,23 +214,27 @@ def cmd_update(config: Config, db: Database, args: argparse.Namespace) -> None:
                     completed_count = 0
                     ok_count = 0
                     fail_count = 0
-                    for fut in as_completed(futures):
-                        dev = futures[fut]
-                        completed_count += 1
-                        try:
-                            res = fut.result()
-                        except Exception as e:
-                            res = ("FAILED_UPGRADE", f"EXCEPTION: {e}")
-                        status, detail = res if isinstance(res, tuple) else (str(res), "")
-                        color = "green" if status in ("UPDATED", "DRY_RUN_OK") else ("yellow" if status == "SKIPPED" else "red")
-                        tag = "  OK  " if status in ("UPDATED", "DRY_RUN_OK") else (" SKIP " if status == "SKIPPED" else "CHYBA ")
-                        if status in ("UPDATED", "DRY_RUN_OK"):
-                            ok_count += 1
-                        elif status != "SKIPPED":
-                            fail_count += 1
-                        ident = (dev.get("identity") or dev.get("model") or "MikroTik")[:25]
-                        console.print(f"  [{completed_count}/{len(devs_to_update)}] [{color}][{tag}][/{color}] {dev['ip']} ({ident}): {detail or status}")
-                        status_bar.update(f"[bold cyan]Probiha aktualizace (hotovo {completed_count}/{len(devs_to_update)} | {ok_count} OK, {fail_count} chyb)...[/bold cyan]")
+                    remaining = set(futures.keys())
+                    while remaining:
+                        done, remaining = wait(remaining, timeout=2.0, return_when=FIRST_COMPLETED)
+                        for fut in done:
+                            dev = futures[fut]
+                            completed_count += 1
+                            try:
+                                res = fut.result()
+                            except Exception as e:
+                                res = ("FAILED_UPGRADE", f"EXCEPTION: {e}")
+                            status, detail = res if isinstance(res, tuple) else (str(res), "")
+                            color = "green" if status in ("UPDATED", "DRY_RUN_OK") else ("yellow" if status == "SKIPPED" else "red")
+                            tag = "  OK  " if status in ("UPDATED", "DRY_RUN_OK") else (" SKIP " if status == "SKIPPED" else "CHYBA ")
+                            if status in ("UPDATED", "DRY_RUN_OK"):
+                                ok_count += 1
+                            elif status != "SKIPPED":
+                                fail_count += 1
+                            ident = (dev.get("identity") or dev.get("model") or "MikroTik")[:25]
+                            console.print(f"  [{completed_count}/{len(devs_to_update)}] [{color}][{tag}][/{color}] {dev['ip']} ({ident}): {detail or status}")
+                        waiting_str = updater._get_waiting_status_str()
+                        status_bar.update(f"[bold cyan]Probiha aktualizace ({completed_count}/{len(devs_to_update)} | {ok_count} OK, {fail_count} chyb){waiting_str}...[/bold cyan]")
     else:
         # Fazovany update podle vln
         updater.run_update_waves(target_wave=args.wave, dry_run=args.dry_run, workers=args.workers)

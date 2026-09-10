@@ -3,10 +3,12 @@ import re
 import time
 import urllib.request
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from typing import Dict, Any, List, Optional, Tuple
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
 
 from config import Config
@@ -113,6 +115,39 @@ class Updater:
     def __init__(self, config: Config, db: Database):
         self.config = config
         self.db = db
+        self._waiting_lock = threading.Lock()
+        self._waiting_devices: Dict[str, Dict[str, Any]] = {}
+
+    def _register_waiting(self, ip: str, identity: str, timeout: int) -> None:
+        # Registrace routeru cekajiciho na reboot pro live zobrazeni
+        with self._waiting_lock:
+            self._waiting_devices[ip] = {
+                "identity": identity,
+                "start": time.time(),
+                "timeout": timeout,
+            }
+
+    def _unregister_waiting(self, ip: str) -> None:
+        # Odregistrace routeru po dokonceni nabehnuti
+        with self._waiting_lock:
+            self._waiting_devices.pop(ip, None)
+
+    def _get_waiting_status_str(self) -> str:
+        # Sestaveni textu se zivym poctem vterin pro stavovy radek
+        with self._waiting_lock:
+            if not self._waiting_devices:
+                return ""
+            now = time.time()
+            items = []
+            for ip, info in list(self._waiting_devices.items()):
+                elapsed = int(now - info["start"])
+                timeout = info["timeout"]
+                ident = info["identity"][:15]
+                items.append(f"{ip} ({ident}, {elapsed}s/{timeout}s)")
+            if len(items) <= 2:
+                return " | Ceka na reboot: " + ", ".join(items)
+            else:
+                return f" | Ceka na reboot ({len(items)} routeru, napr. {items[0]})"
 
     def get_latest_versions(self) -> Tuple[str, str]:
         # Nacteni aktualnich stabilnich verzi pro ROS v6 a v7
@@ -246,6 +281,7 @@ class Updater:
 
                 # C) Spusteni instalace (zahaji stahovani balicku a nasledny reboot)
                 try:
+                    # 1. Zkusime moderni prikaz 'install' (RouterOS 6.36+ a RouterOS v7)
                     stdin, stdout, stderr = client.exec_command("/system package update install", timeout=10.0)
                     time.sleep(1.0)
                     err_out = ""
@@ -254,21 +290,33 @@ class Updater:
                     if stderr.channel.recv_stderr_ready():
                         err_out += stderr.channel.recv_stderr(4096).decode("latin-1", errors="ignore")
 
+                    # 2. Pokud router nepodporuje 'install', zkusime starsi prikaz 'upgrade' (RouterOS <= 6.35)
                     if "bad command name" in err_out.lower() or "syntax error" in err_out.lower():
-                        logger.info(f"{ip}: Router nepodporuje 'update install' (legacy verze), pouzivam stazeni pres /tool fetch...")
+                        logger.info(f"{ip}: Router nepodporuje 'install' (ROS <= 6.35), zkousim legacy prikaz 'upgrade'...")
+                        stdin, stdout, stderr = client.exec_command("/system package update upgrade", timeout=10.0)
+                        time.sleep(1.0)
+                        err_out = ""
+                        if stdout.channel.recv_ready():
+                            err_out += stdout.channel.recv(4096).decode("latin-1", errors="ignore")
+                        if stderr.channel.recv_stderr_ready():
+                            err_out += stderr.channel.recv_stderr(4096).decode("latin-1", errors="ignore")
+
+                    # 3. Pokud router nepodporuje ani 'upgrade' (napr. ROS v5), pouzijeme stazeni pres /tool fetch
+                    if "bad command name" in err_out.lower() or "syntax error" in err_out.lower():
+                        logger.info(f"{ip}: Router nepodporuje 'package update' (legacy verze), pouzivam stazeni pres /tool fetch...")
                         arch = device.get("architecture")
                         if not arch:
-                            res_tmp = execute_ssh_command(client, "/system resource print")
+                            res_tmp = execute_ssh_command(client, "/system resource print", timeout=5.0)
                             arch = parse_key_value_output(res_tmp).get("architecture-name", "mipsbe")
 
                         pkg_name = f"routeros-{arch}-{target_ver}.npk"
                         logger.info(f"{ip}: Stahovani balicku {pkg_name} pres /tool fetch...")
                         fetch_cmd = f'/tool fetch url="http://upgrade.mikrotik.com/routeros/{target_ver}/{pkg_name}" mode=http'
-                        execute_ssh_command(client, fetch_cmd, timeout=180.0)
+                        execute_ssh_command(client, fetch_cmd, timeout=120.0)
                         time.sleep(2.0)
 
-                        files_list = execute_ssh_command(client, "/file print")
-                        if pkg_name in files_list or "routeros" in files_list:
+                        files_list = execute_ssh_command(client, "/file print detail", timeout=5.0)
+                        if pkg_name in files_list:
                             logger.info(f"{ip}: Balicek uspesne stazen do uloziste, provadim restart routeru...")
                             execute_ssh_command(client, '/system script add name=reboot-upgrade source="/system reboot" policy=reboot,read,write')
                             try:
@@ -293,62 +341,67 @@ class Updater:
             start_time = time.time()
             reboot_detected = False
             recovered = False
+            dev_ident = (device.get("identity") or device.get("model") or "MikroTik")
+            self._register_waiting(ip, dev_ident, self.config.max_recovery_timeout)
 
-            while (time.time() - start_time) < self.config.max_recovery_timeout:
-                time.sleep(self.config.ping_retry_interval)
-                elapsed = int(time.time() - start_time)
-                is_ping_ok = ping_host(ip, timeout=1.5)
+            try:
+                while (time.time() - start_time) < self.config.max_recovery_timeout:
+                    time.sleep(self.config.ping_retry_interval)
+                    elapsed = int(time.time() - start_time)
+                    is_ping_ok = ping_host(ip, timeout=1.5)
 
-                if not is_ping_ok:
-                    if not reboot_detected:
-                        logger.info(f"{ip}: Router se restartuje (ubehlo {elapsed}s)...")
-                        reboot_detected = True
-                    continue
-
-                # Pokud ping odpovida, proverime stav pres SSH
-                client_chk = create_ssh_connection(ip, port, user, pwd, timeout=4.0)
-                if not client_chk:
-                    # SSH jeste nenabehlo nebo router prave restartuje
-                    continue
-
-                try:
-                    res_raw = execute_ssh_command(client_chk, "/system resource print", timeout=5.0)
-                    res_data = parse_key_value_output(res_raw)
-                    curr_check_ver = res_data.get("version", "").split()[0]
-                    curr_uptime_sec = parse_mikrotik_uptime(res_data.get("uptime", ""))
-
-                    # 1. Pokud jiz bezi cilova verze -> update uspesny
-                    if curr_check_ver == target_ver:
-                        logger.info(f"{ip}: Detekovana nova cilova verze {curr_check_ver}!")
-                        recovered = True
-                        break
-
-                    # 2. Pokud ma router stale starou verzi, proverime uptime a stav stahovani
-                    if curr_uptime_sec > (elapsed + 30):
-                        # Dotaz na aktualni stav balicku
-                        pkg_raw = execute_ssh_command(client_chk, "/system package update print without-paging", timeout=4.0)
-                        pkg_data = parse_key_value_output(pkg_raw)
-                        pkg_status = pkg_data.get("status", "")
-                        if "ERROR" in pkg_status.upper():
-                            logger.error(f"{ip}: Stahovani balicku selhalo: {pkg_status}")
-                            self.db.update_device_status(dev_id, status="FAILED_UPGRADE", attempts=attempts, error=f"Chyba stahovani: {pkg_status}")
-                            return "FAILED_UPGRADE", f"Chyba stahovani: {pkg_status}"
-
-                        status_info = f", stav: {pkg_status}" if pkg_status else ""
-                        logger.info(f"{ip}: Router stahuje balicky a ceka na reboot (uptime: {res_data.get('uptime')}, ubehlo {elapsed}s{status_info})...")
+                    if not is_ping_ok:
+                        if not reboot_detected:
+                            logger.info(f"{ip}: Router se restartuje (ubehlo {elapsed}s)...")
+                            reboot_detected = True
                         continue
-                    else:
-                        # Router skutecne rebootoval, ale nabehl s meziverzi
-                        logger.warning(f"{ip}: Router po restartu nabehl s verzi {curr_check_ver} (uptime: {res_data.get('uptime')})")
-                        recovered = True
-                        break
-                except Exception:
-                    pass
-                finally:
+
+                    # Pokud ping odpovida, proverime stav pres SSH
+                    client_chk = create_ssh_connection(ip, port, user, pwd, timeout=4.0)
+                    if not client_chk:
+                        # SSH jeste nenabehlo nebo router prave restartuje
+                        continue
+
                     try:
-                        client_chk.close()
+                        res_raw = execute_ssh_command(client_chk, "/system resource print", timeout=5.0)
+                        res_data = parse_key_value_output(res_raw)
+                        curr_check_ver = res_data.get("version", "").split()[0]
+                        curr_uptime_sec = parse_mikrotik_uptime(res_data.get("uptime", ""))
+
+                        # 1. Pokud jiz bezi cilova verze -> update uspesny
+                        if curr_check_ver == target_ver:
+                            logger.info(f"{ip}: Detekovana nova cilova verze {curr_check_ver}!")
+                            recovered = True
+                            break
+
+                        # 2. Pokud ma router stale starou verzi, proverime uptime a stav stahovani
+                        if curr_uptime_sec > (elapsed + 30):
+                            # Dotaz na aktualni stav balicku
+                            pkg_raw = execute_ssh_command(client_chk, "/system package update print without-paging", timeout=4.0)
+                            pkg_data = parse_key_value_output(pkg_raw)
+                            pkg_status = pkg_data.get("status", "")
+                            if "ERROR" in pkg_status.upper():
+                                logger.error(f"{ip}: Stahovani balicku selhalo: {pkg_status}")
+                                self.db.update_device_status(dev_id, status="FAILED_UPGRADE", attempts=attempts, error=f"Chyba stahovani: {pkg_status}")
+                                return "FAILED_UPGRADE", f"Chyba stahovani: {pkg_status}"
+
+                            status_info = f", stav: {pkg_status}" if pkg_status else ""
+                            logger.info(f"{ip}: Router stahuje balicky a ceka na reboot (uptime: {res_data.get('uptime')}, ubehlo {elapsed}s{status_info})...")
+                            continue
+                        else:
+                            # Router skutecne rebootoval, ale nabehl s meziverzi
+                            logger.warning(f"{ip}: Router po restartu nabehl s verzi {curr_check_ver} (uptime: {res_data.get('uptime')})")
+                            recovered = True
+                            break
                     except Exception:
                         pass
+                    finally:
+                        try:
+                            client_chk.close()
+                        except Exception:
+                            pass
+            finally:
+                self._unregister_waiting(ip)
 
             if not recovered:
                 msg = f"Router nedokoncil update/reboot do {self.config.max_recovery_timeout}s"
@@ -377,9 +430,68 @@ class Updater:
                 cur_fw = rb_data.get("current-firmware")
                 upg_fw = rb_data.get("upgrade-firmware")
 
+                needs_post_reboot = False
+                reboot_reasons = []
+
                 if cur_fw and upg_fw and cur_fw != upg_fw:
                     logger.info(f"{ip}: Aktualizace RouterBOOT firmware z {cur_fw} na {upg_fw}...")
                     execute_ssh_command(client_after, "/system routerboard upgrade")
+                    needs_post_reboot = True
+                    reboot_reasons.append(f"RouterBOOT ({cur_fw} -> {upg_fw})")
+
+                # Kontrola chyby poskozeneho SSH host klice v logu
+                log_ssh = execute_ssh_command(client_after, '/log print without-paging where topics~"ssh"')
+                if "corrupt host" in log_ssh.lower() or "regenerating it" in log_ssh.lower():
+                    logger.warning(f"{ip}: Detekovan poskozeny SSH host klic v logu, vyvolavam regeneraci...")
+                    try:
+                        execute_ssh_command(client_after, '/system script add name=regen-ssh source="/ip ssh regenerate-host-key"')
+                        execute_ssh_command(client_after, '/system script run regen-ssh')
+                        execute_ssh_command(client_after, '/system script remove [find name="regen-ssh"]')
+                    except Exception as e:
+                        logger.error(f"{ip}: Chyba pri regeneraci SSH klice: {e}")
+                    needs_post_reboot = True
+                    reboot_reasons.append("regenerace SSH klice")
+
+                # Pokud byl zmenen RouterBOOT nebo regenerovan SSH klic, provedeme restart pro aplikaci zmen
+                if needs_post_reboot:
+                    reason_desc = " a ".join(reboot_reasons)
+                    logger.info(f"{ip}: Restart routeru pro aplikaci: {reason_desc}...")
+                    try:
+                        execute_ssh_command(client_after, '/system script add name=reboot-post source="/system reboot"')
+                        client_after.exec_command("/system script run reboot-post", timeout=2.0)
+                    except Exception:
+                        pass
+                    try:
+                        client_after.close()
+                    except Exception:
+                        pass
+                    client_after = None
+
+                    # Cekani na dokonceni restartu a nabehnuti SSH
+                    self._register_waiting(ip, dev_ident, 180)
+                    try:
+                        time.sleep(15)
+                        post_reboot_recovered = False
+                        p_start = time.time()
+                        while (time.time() - p_start) < 180:
+                            time.sleep(5)
+                            if ping_host(ip, timeout=1.5):
+                                c_test = create_ssh_connection(ip, port, user, pwd, timeout=4.0)
+                                if c_test:
+                                    client_after = c_test
+                                    post_reboot_recovered = True
+                                    break
+                    finally:
+                        self._unregister_waiting(ip)
+
+                    if post_reboot_recovered and client_after:
+                        logger.info(f"{ip}: Router po restartu ({reason_desc}) v poradku nabehl.")
+                        try:
+                            execute_ssh_command(client_after, '/system script remove [find name="reboot-post"]')
+                        except Exception:
+                            pass
+                    else:
+                        logger.warning(f"{ip}: Router po restartu ({reason_desc}) neodpovedel vcas na SSH.")
 
                 # Porovnani verze
                 is_target = (new_ver == target_ver)
@@ -388,12 +500,16 @@ class Updater:
                 if is_target or not needs_more:
                     logger.info(f"{ip}: Uspesne aktualizovan na cilovou verzi {new_ver}")
                     # Bezpecnostni test po dokonceni aktualizace (flagged: yes, ops)
-                    is_flag, flag_reason, sec_notice = check_device_security(client_after)
-                    if is_flag:
-                        logger.critical(f"{ip}: POZOR! Zarizeni je po aktualizaci kompromitovano: {flag_reason}")
-                        console.print(f"[bold white on red]KRITICKE VAROVANI: {ip} byl po aktualizaci detekovan jako KOMPROMITOVANY ({flag_reason})![/bold white on red]")
-                    else:
-                        logger.info(f"{ip}: Bezpecnostni kontrola v poradku (flagged: no, zadny neznamy ucet)")
+                    is_flag = False
+                    flag_reason = None
+                    sec_notice = None
+                    if client_after:
+                        is_flag, flag_reason, sec_notice = check_device_security(client_after)
+                        if is_flag:
+                            logger.critical(f"{ip}: POZOR! Zarizeni je po aktualizaci kompromitovano: {flag_reason}")
+                            console.print(f"[bold white on red]KRITICKE VAROVANI: {ip} byl po aktualizaci detekovan jako KOMPROMITOVANY ({flag_reason})![/bold white on red]")
+                        else:
+                            logger.info(f"{ip}: Bezpecnostni kontrola v poradku (flagged: no, zadny neznamy ucet)")
 
                     self.db.update_device_status(
                         dev_id,
@@ -419,10 +535,11 @@ class Updater:
             except Exception as e:
                 logger.error(f"{ip}: Chyba pri overovani po upgradu: {e}")
             finally:
-                try:
-                    client_after.close()
-                except Exception:
-                    pass
+                if client_after is not None:
+                    try:
+                        client_after.close()
+                    except Exception:
+                        pass
 
         # Prekrocen pocet pokusu
         fail_msg = f"Prekrocen maximalni pocet pokusu ({self.config.max_attempts}) bez dosazeni cilove verze"
@@ -500,6 +617,7 @@ class Updater:
         total_ok = 0
         total_skipped = 0
         total_failed = 0
+        all_failed_summary: List[Tuple[Dict[str, Any], str, int]] = []
 
         try:
             for wave in sorted_waves:
@@ -546,6 +664,7 @@ class Updater:
                 wave_ok = 0
                 wave_skipped = 0
                 wave_failed = 0
+                failed_in_wave: List[Tuple[Dict[str, Any], str]] = []
 
                 def process_result(dev: Dict[str, Any], res: Any):
                     nonlocal completed_count, wave_ok, wave_skipped, wave_failed
@@ -563,6 +682,7 @@ class Updater:
                         console.print(f"{prefix} [bold yellow][ SKIP ][/bold yellow] {ip} ({ident}): {detail or status}")
                     else:
                         wave_failed += 1
+                        failed_in_wave.append((dev, detail or status))
                         console.print(f"{prefix} [bold red][CHYBA ][/bold red] {ip} ({ident}): {detail or status}")
 
                 with console.status(f"[bold cyan]Vlna {wave}: Probiha stahovani a reboot routeru (zpracovano 0/{total_wave}, bezi {effective_workers} vlaken)...[/bold cyan]") as status_bar:
@@ -572,14 +692,18 @@ class Updater:
                                 executor.submit(self.upgrade_single_device, dev, dry_run): dev
                                 for dev in to_update
                             }
-                            for fut in as_completed(futures):
-                                dev = futures[fut]
-                                try:
-                                    res = fut.result()
-                                except Exception as e:
-                                    res = ("FAILED_UPGRADE", f"Vyjinka: {e}")
-                                process_result(dev, res)
-                                status_bar.update(f"[bold cyan]Vlna {wave}: Probiha aktualizace (hotovo {completed_count}/{total_wave} | {wave_ok} OK, {wave_failed} chyb)...[/bold cyan]")
+                            remaining = set(futures.keys())
+                            while remaining:
+                                done, remaining = wait(remaining, timeout=2.0, return_when=FIRST_COMPLETED)
+                                for fut in done:
+                                    dev = futures[fut]
+                                    try:
+                                        res = fut.result()
+                                    except Exception as e:
+                                        res = ("FAILED_UPGRADE", f"Vyjinka: {e}")
+                                    process_result(dev, res)
+                                waiting_str = self._get_waiting_status_str()
+                                status_bar.update(f"[bold cyan]Vlna {wave}: Probiha aktualizace ({completed_count}/{total_wave} | {wave_ok} OK, {wave_failed} chyb){waiting_str}...[/bold cyan]")
                     else:
                         for dev in to_update:
                             try:
@@ -587,7 +711,73 @@ class Updater:
                             except Exception as e:
                                 res = ("FAILED_UPGRADE", f"Vyjinka: {e}")
                             process_result(dev, res)
-                            status_bar.update(f"[bold cyan]Vlna {wave}: Probiha aktualizace (hotovo {completed_count}/{total_wave} | {wave_ok} OK, {wave_failed} chyb)...[/bold cyan]")
+                            waiting_str = self._get_waiting_status_str()
+                            status_bar.update(f"[bold cyan]Vlna {wave}: Probiha aktualizace ({completed_count}/{total_wave} | {wave_ok} OK, {wave_failed} chyb){waiting_str}...[/bold cyan]")
+
+                # Automaticky 2. pokus (retry) pro neuspesne routery v ramci vlny
+                if failed_in_wave:
+                    retry_devs = [f[0] for f in failed_in_wave]
+                    console.print(f"\n[bold yellow]-> Detekovano {len(retry_devs)} chyb ve Vlne {wave}. Vyckavam 15s na zklidneni site po rebootech a spoustim automaticky 2. pokus (retry)...[/bold yellow]")
+                    time.sleep(15)
+
+                    retry_workers = min(max_workers, len(retry_devs))
+                    still_failed: List[Tuple[Dict[str, Any], str]] = []
+                    retry_completed = 0
+                    retry_total = len(retry_devs)
+
+                    def process_retry_result(dev: Dict[str, Any], res: Any):
+                        nonlocal wave_ok, wave_failed, wave_skipped, retry_completed
+                        retry_completed += 1
+                        status, detail = res if isinstance(res, tuple) else (str(res), "")
+                        ip = dev["ip"]
+                        ident = (dev.get("identity") or dev.get("model") or "MikroTik")[:25]
+                        prefix = f"  [Retry {retry_completed}/{retry_total}]"
+
+                        if status in ("UPDATED", "DRY_RUN_OK"):
+                            wave_ok += 1
+                            wave_failed -= 1
+                            console.print(f"{prefix} [bold green][  OK  ][/bold green] {ip} ({ident}): {detail or status}")
+                        elif status == "SKIPPED":
+                            wave_skipped += 1
+                            wave_failed -= 1
+                            console.print(f"{prefix} [bold yellow][ SKIP ][/bold yellow] {ip} ({ident}): {detail or status}")
+                        else:
+                            still_failed.append((dev, detail or status))
+                            console.print(f"{prefix} [bold red][CHYBA ][/bold red] {ip} ({ident}): {detail or status}")
+
+                    with console.status(f"[bold cyan]Vlna {wave} (Retry): Probiha opakovany pokus...[/bold cyan]") as status_bar:
+                        if retry_workers > 1:
+                            with ThreadPoolExecutor(max_workers=retry_workers) as executor:
+                                retry_futures = {
+                                    executor.submit(self.upgrade_single_device, dev, dry_run): dev
+                                    for dev in retry_devs
+                                }
+                                remaining = set(retry_futures.keys())
+                                while remaining:
+                                    done, remaining = wait(remaining, timeout=2.0, return_when=FIRST_COMPLETED)
+                                    for fut in done:
+                                        dev = retry_futures[fut]
+                                        try:
+                                            res = fut.result()
+                                        except Exception as e:
+                                            res = ("FAILED_UPGRADE", f"Vyjinka: {e}")
+                                        process_retry_result(dev, res)
+                                    waiting_str = self._get_waiting_status_str()
+                                    status_bar.update(f"[bold cyan]Vlna {wave} (Retry): Probiha ({retry_completed}/{retry_total}){waiting_str}...[/bold cyan]")
+                        else:
+                            for dev in retry_devs:
+                                try:
+                                    res = self.upgrade_single_device(dev, dry_run=dry_run)
+                                except Exception as e:
+                                    res = ("FAILED_UPGRADE", f"Vyjinka: {e}")
+                                process_retry_result(dev, res)
+                                waiting_str = self._get_waiting_status_str()
+                                status_bar.update(f"[bold cyan]Vlna {wave} (Retry): Probiha ({retry_completed}/{retry_total}){waiting_str}...[/bold cyan]")
+
+                    failed_in_wave = still_failed
+
+                for f_dev, f_err in failed_in_wave:
+                    all_failed_summary.append((f_dev, f_err, wave))
 
                 total_ok += wave_ok
                 total_skipped += wave_skipped
@@ -595,6 +785,25 @@ class Updater:
                 console.print(f"[bold green]=== Vlna {wave} dokoncena ({wave_ok} aktualizovano, {wave_skipped} preskoceno, {wave_failed} chyb) ===[/bold green]")
 
             console.print(f"\n[bold cyan]=== Fazovany update dokoncen (celkem: {total_ok} aktualizovano, {total_skipped} preskoceno, {total_failed} chyb) ===[/bold cyan]")
+
+            # Zaverecna prehledna tabulka chybnych zarizeni pokud nejaka pretrvavaji
+            if all_failed_summary:
+                console.print()
+                f_table = Table(title=f"[bold red]Zarizeni vyzadujici manualni pozornost (chyba i po opakovani: {len(all_failed_summary)})[/bold red]")
+                f_table.add_column("IP", style="cyan", no_wrap=True)
+                f_table.add_column("Identity", style="bold magenta")
+                f_table.add_column("Model", style="blue")
+                f_table.add_column("Vlna", justify="center")
+                f_table.add_column("Duvod / Posledni chyba", style="yellow")
+                for dev, err, w in all_failed_summary:
+                    f_table.add_row(
+                        dev.get("ip", ""),
+                        dev.get("identity") or "-",
+                        dev.get("model") or "-",
+                        str(w),
+                        str(err or dev.get("last_error") or "Chyba aktualizace"),
+                    )
+                console.print(f_table)
         finally:
             for h, lvl in orig_levels.items():
                 h.setLevel(lvl)

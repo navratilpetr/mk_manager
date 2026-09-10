@@ -4,6 +4,19 @@ Všechny významné změny v projektu **MikroTik ISP Manager (`mk_manager`)** js
 
 Formát vychází ze zásad [Keep a Changelog](https://keepachangelog.com/cs/1.0.0/) a projekt dodržuje [Sémantické verzování](https://semver.org/lang/cs/).
 
+## [1.0.2] - 2026-09-10
+
+### Přidáno
+- **Živý odpočet čekajících routerů:** V průběhu vlny se v animovaném stavovém řádku každé 2 s zobrazují konkrétní routery, na jejichž reboot/naběhnutí se čeká, včetně ubíhajícího času (např. `172.30.5.18 (Valasek_Michal_sw, 45s/600s)`).
+- **Automatické 2. kolo (Retry) na konci vlny:** Pokud ve vlně dojde k chybě (např. kvůli dočasnému restartu nadřazeného AP), updater po 15s zklidnění sítě automaticky spustí druhý pokus pouze pro selhaná zařízení dříve, než postoupí do další vlny.
+- **Závěrečný souhrn neúspěšných routerů:** Pokud nějaký router neprojde ani po opakovaném pokusu, na konci běhu se vypíše přehledná tabulka s IP, identitou, modelem, číslem vlny a přesným důvodem chyby.
+
+### Opraveno a vylepšeno
+- **Podpora legacy příkazu pro RouterOS <= 6.35:** Na starších verzích RouterOS (kde ještě neexistoval příkaz `/system package update install`), updater automaticky použije původní příkaz `/system package update upgrade`, takže router stáhne balíčky a provede update bez nutnosti spoléhat na nestabilní `/tool fetch`.
+- **Automatická oprava poškozeného SSH klíče:** Pokud po instalaci balíčku router ohlásí v logu `Corrupt host's key, regenerating it! Reboot required!`, updater přes dávkový skript vyvolá `/ip ssh regenerate-host-key` a router čistě restartuje pro načtení nového klíče.
+- **Automatický reboot po RouterBOOT firmware upgrade:** Po provedení `/system routerboard upgrade` je nově zařazen restart routeru, aby nový bootloader ihned naběhl.
+- **Striktní celkový timeout SSH příkazů:** Funkce `execute_ssh_command` nově hlídá celkový uplynulý čas příkazu (nejen nečinnost soketu), což zabraňuje jakémukoliv uvíznutí vlákna při komunikaci s routerem.
+
 ---
 
 ## [1.0.1] - 2026-09-09
